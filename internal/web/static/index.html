@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>open-gpu-mesh</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2322c55e'/><path d='M8 11h16v10H8z M11 8v3 M16 8v3 M21 8v3 M11 21v3 M16 21v3 M21 21v3' stroke='%23052e16' stroke-width='2.4' fill='none'/></svg>">
+<style>
+:root{--bg:#0b0f14;--panel:#111821;--panel2:#16202b;--line:#223041;--text:#dbe5ef;--mute:#8296aa;--acc:#22c55e;--acc2:#16a34a;--warn:#f59e0b;--bad:#ef4444;--info:#38bdf8;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+*{box-sizing:border-box}html,body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+a{color:var(--info);text-decoration:none}a:hover{text-decoration:underline}
+header{display:flex;align-items:center;gap:18px;padding:10px 20px;border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:5}
+header .logo{display:flex;align-items:center;gap:9px;font-weight:700;letter-spacing:.2px}
+header .logo i{width:22px;height:22px;border-radius:6px;background:var(--acc);display:inline-block;box-shadow:0 0 18px #22c55e55}
+nav{display:flex;gap:4px;flex-wrap:wrap}nav a{color:var(--mute);padding:6px 10px;border-radius:7px}nav a.on,nav a:hover{color:var(--text);background:var(--panel2);text-decoration:none}
+header .me{margin-left:auto;color:var(--mute);font-size:13px;display:flex;gap:10px;align-items:center}
+main{max-width:1320px;margin:0 auto;padding:22px 20px 60px}
+h1{font-size:20px;margin:0 0 14px}h2{font-size:15px;margin:22px 0 10px;color:var(--mute);font-weight:600;text-transform:uppercase;letter-spacing:.6px}
+.grid{display:grid;gap:12px}.g4{grid-template-columns:repeat(auto-fill,minmax(190px,1fr))}.g2{grid-template-columns:repeat(auto-fill,minmax(420px,1fr))}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+.stat .v{font-size:26px;font-weight:700}.stat .l{color:var(--mute);font-size:12px;text-transform:uppercase;letter-spacing:.5px}
+table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);white-space:nowrap;vertical-align:top}th{color:var(--mute);font-weight:600;font-size:12px;background:var(--panel2)}
+tr:last-child td{border-bottom:0}tbody tr:hover{background:#ffffff05}td.wrap{white-space:normal}
+.pill{display:inline-block;padding:1px 8px;border-radius:99px;font-size:12px;background:var(--panel2);border:1px solid var(--line)}
+.ok{color:var(--acc)}.warn{color:var(--warn)}.bad{color:var(--bad)}.mute{color:var(--mute)}.mono{font-family:var(--mono);font-size:12.5px}
+.pill.ok{border-color:#22c55e55;background:#22c55e14}.pill.warn{border-color:#f59e0b55;background:#f59e0b14}.pill.bad{border-color:#ef444455;background:#ef444414}.pill.info{color:var(--info);border-color:#38bdf855;background:#38bdf814}
+button,.btn{background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:6px 12px;cursor:pointer;font:inherit}
+button:hover{border-color:#3a4f66}button.primary{background:var(--acc2);border-color:var(--acc2);color:#fff}button.danger{color:var(--bad)}
+input,textarea,select{background:#0a0e13;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:7px 9px;font:inherit;width:100%}
+textarea{font-family:var(--mono);font-size:12.5px;min-height:220px}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.row>*{flex:0 0 auto}.sp{flex:1}
+.bar{height:6px;background:#0a0e13;border-radius:9px;overflow:hidden;min-width:60px}.bar>i{display:block;height:100%;background:var(--acc)}
+.logs{background:#06090c;border:1px solid var(--line);border-radius:10px;padding:10px;font-family:var(--mono);font-size:12px;height:360px;overflow:auto;white-space:pre-wrap}
+.logs .t{color:#5b6f83}.logs .i{color:#7aa2c9}.logs .e{color:#f99}
+.login{max-width:460px;margin:80px auto}.hero{color:var(--mute);margin:-6px 0 18px}
+.tabs{display:flex;gap:6px;margin:16px 0 10px}.tabs a{padding:6px 12px;border-radius:8px;color:var(--mute);border:1px solid transparent}.tabs a.on{color:var(--text);border-color:var(--line);background:var(--panel)}
+.kv{display:grid;grid-template-columns:160px 1fr;gap:6px 14px}.kv div:nth-child(odd){color:var(--mute)}
+pre{background:#06090c;border:1px solid var(--line);border-radius:10px;padding:10px;overflow:auto;font-size:12px}
+.toast{position:fixed;right:18px;bottom:18px;background:var(--panel2);border:1px solid var(--line);padding:10px 14px;border-radius:10px;max-width:520px;white-space:pre-wrap;z-index:9}
+.gpu{display:inline-flex;gap:6px;align-items:center;margin:2px 6px 2px 0}.dot{width:8px;height:8px;border-radius:99px;display:inline-block;background:var(--mute)}.dot.ok{background:var(--acc)}.dot.warn{background:var(--warn)}.dot.bad{background:var(--bad)}
+.empty{padding:28px;text-align:center;color:var(--mute)}
+</style>
+</head>
+<body>
+<header>
+  <div class="logo"><i></i><span id="cname">open-gpu-mesh</span></div>
+  <nav id="nav"></nav>
+  <div class="me" id="me"></div>
+</header>
+<main id="app"></main>
+<div id="toast" class="toast" style="display:none"></div>
+<script>
+const $ = (s, el=document) => el.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let KEY = localStorage.getItem('ogm_key') || '';
+let PROJECT = localStorage.getItem('ogm_project') || 'default';
+let timer = null, abortLogs = null;
+
+async function api(method, path, body) {
+  const opt = {method, headers: {'OGM-Api-Key': KEY}};
+  if (body !== undefined) { opt.body = typeof body === 'string' ? body : JSON.stringify(body); opt.headers['Content-Type'] = 'application/json'; }
+  const r = await fetch(path, opt);
+  if (r.status === 401) { logout(); throw new Error('unauthorized'); }
+  if (r.status === 204 || r.status === 202 && !r.headers.get('content-type')) return null;
+  const t = await r.text();
+  let j = null; try { j = t ? JSON.parse(t) : null } catch { j = t }
+  if (!r.ok) {
+    let msg = (j && j.title) ? j.title + (j.detail ? ': ' + j.detail : '') : r.statusText;
+    if (j && j.errors) msg += '\n' + Object.entries(j.errors).map(([k,v]) => `  ${k}: ${v.join('; ')}`).join('\n');
+    throw new Error(msg);
+  }
+  return j;
+}
+function toast(msg, bad) { const t = $('#toast'); t.textContent = msg; t.style.display = 'block'; t.style.borderColor = bad ? 'var(--bad)' : 'var(--line)'; clearTimeout(t._h); t._h = setTimeout(() => t.style.display = 'none', bad ? 7000 : 3000); }
+function logout() { localStorage.removeItem('ogm_key'); KEY = ''; route(); }
+const ago = t => { if (!t) return '-'; const s = (Date.now() - new Date(t)) / 1000; if (s < 60) return Math.floor(s) + 's'; if (s < 3600) return Math.floor(s/60) + 'm'; if (s < 172800) return Math.floor(s/3600) + 'h'; return Math.floor(s/86400) + 'd'; };
+const statusPill = s => { const c = {running:'ok',ready:'ok',online:'ok',succeeded:'ok',deploying:'info',allocating:'warn',downloading:'info',creating:'info',pending:'warn',stopping:'warn',stopped:'',offline:'bad',failed:'bad',cancelled:'',paused:'warn'}[s] ?? ''; return `<span class="pill ${c}">${esc(s)}</span>`; };
+const gb = mb => (mb/1024).toFixed(mb >= 10240 ? 0 : 1);
+
+const pages = [['#/', 'Overview'], ['#/groups', 'Container groups'], ['#/queues', 'Queues'], ['#/nodes', 'Nodes'], ['#/members', 'Members'], ['#/deploy', 'Deploy'], ['#/settings', 'Settings']];
+
+async function route() {
+  clearInterval(timer); if (abortLogs) { abortLogs.abort(); abortLogs = null; }
+  const h = location.hash || '#/';
+  if (!KEY) { renderLogin(); return; }
+  $('#nav').innerHTML = pages.map(([href, label]) => `<a href="${href}" class="${(h === href || (href !== '#/' && h.startsWith(href))) ? 'on' : ''}">${label}</a>`).join('');
+  try {
+    const me = await api('GET', '/v1/me');
+    if (!window._cname) { window._cname = (await api('GET', '/v1/cluster')).name; document.title = window._cname + ' · ogm'; }
+    $('#cname').textContent = window._cname;
+    const projects = (await api('GET', '/v1/projects')).items;
+    if (!projects.find(p => p.name === PROJECT) && projects.length) PROJECT = projects[0].name;
+    $('#me').innerHTML = `<select id="proj" style="width:auto;padding:3px 6px">${projects.map(p => `<option ${p.name === PROJECT ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select>
+      <span>${esc(me.name)} · <b class="ok">${me.credits.toFixed(2)}</b> credits</span><a href="#" onclick="logout();return false">log out</a>`;
+    $('#proj').onchange = e => { PROJECT = e.target.value; localStorage.setItem('ogm_project', PROJECT); route(); };
+  } catch (e) { return; }
+  const parts = h.slice(2).split('/');
+  const view = {'': viewOverview, groups: parts[1] ? () => viewGroup(decodeURIComponent(parts[1])) : viewGroups, queues: parts[1] ? () => viewQueue(decodeURIComponent(parts[1])) : viewQueues,
+    nodes: viewNodes, members: viewMembers, deploy: viewDeploy, settings: viewSettings}[parts[0]] || viewOverview;
+  const run = async () => { try { await view(); } catch (e) { toast(e.message, true); } };
+  await run();
+  if (!['deploy', 'settings'].includes(parts[0])) timer = setInterval(() => { if (!document.hidden && !document.activeElement?.matches('input,textarea,select')) run(); }, 4000);
+}
+
+function renderLogin() {
+  $('#nav').innerHTML = ''; $('#me').innerHTML = '';
+  $('#app').innerHTML = `<div class="login card"><h1>Sign in</h1><p class="hero">Paste your API key (from <span class="mono">ogm server</span> first run, <span class="mono">ogm join</span>, or <span class="mono">ogm dev</span>).</p>
+    <input id="k" placeholder="ogm_…" autofocus><div class="row" style="margin-top:12px"><button class="primary" id="go">Sign in</button></div>
+    <h2>Have an invite code?</h2><div class="row"><input id="code" placeholder="inv_…" style="flex:1"><input id="uname" placeholder="your-name" style="flex:1"><button id="join">Join</button></div></div>`;
+  const go = async () => { KEY = $('#k').value.trim(); localStorage.setItem('ogm_key', KEY); route(); };
+  $('#go').onclick = go; $('#k').onkeydown = e => e.key === 'Enter' && go();
+  $('#join').onclick = async () => {
+    try { const u = await fetch('/v1/join', {method: 'POST', body: JSON.stringify({code: $('#code').value.trim(), name: $('#uname').value.trim()})}).then(async r => { const j = await r.json(); if (!r.ok) throw new Error(j.title + ': ' + (j.detail || JSON.stringify(j.errors))); return j; });
+      KEY = u.api_key; localStorage.setItem('ogm_key', KEY); PROJECT = u.name; localStorage.setItem('ogm_project', PROJECT);
+      alert('Welcome! Your API key (save it):\n\n' + u.api_key); route(); } catch (e) { toast(e.message, true); }
+  };
+}
+
+async function viewOverview() {
+  const [ci, classes, nodes, groups] = await Promise.all([api('GET', '/v1/cluster'), api('GET', '/v1/gpu-classes'), api('GET', '/v1/nodes'), api('GET', `/v1/projects/${PROJECT}/containers`)]);
+  $('#cname').textContent = ci.name;
+  const stat = (v, l, c='') => `<div class="card stat"><div class="v ${c}">${v}</div><div class="l">${l}</div></div>`;
+  $('#app').innerHTML = `<h1>${esc(ci.name)}</h1><p class="hero">Community GPU cluster · ogm ${esc(ci.version)} · ${esc(ci.public_url)}</p>
+  <div class="grid g4">${stat(`${ci.nodes_online}<span class="mute" style="font-size:15px"> / ${ci.nodes}</span>`, 'nodes online', 'ok')}${stat(`${ci.gpus_free}<span class="mute" style="font-size:15px"> / ${ci.gpus}</span>`, 'GPUs free')}${stat(ci.total_vram_gb.toFixed(0) + ' GB', 'VRAM pooled')}${stat(ci.instances_running, 'instances running')}${stat(ci.container_groups, 'container groups')}${stat(ci.jobs_pending, 'jobs pending', ci.jobs_pending ? 'warn' : '')}${stat(ci.users, 'members')}</div>
+  <h2>GPU availability</h2>
+  ${classes.items.length ? `<table><thead><tr><th>Class</th><th>VRAM</th><th>Online</th><th>Free</th><th>In use</th><th>Utilisation</th><th>Credits/h (high · med · low · batch)</th></tr></thead><tbody>${classes.items.map(c => `<tr><td><b>${esc(c.name)}</b> <span class="mute mono">${esc(c.id)}</span></td><td>${gb(c.vram_mb)} GB</td><td>${c.online}</td><td class="${c.free ? 'ok' : 'warn'}">${c.free}</td><td>${c.in_use}</td><td><div class="bar"><i style="width:${c.online ? (100*c.in_use/c.online) : 0}%"></i></div></td><td class="mono">${['high','medium','low','batch'].map(p => (c.prices[p] ?? 0).toFixed(2)).join(' · ')}</td></tr>`).join('')}</tbody></table>` : `<div class="card empty">No GPUs yet. Add a node in <a href="#/settings">Settings</a>.</div>`}
+  <h2>Your container groups (${esc(PROJECT)})</h2>${groupsTable(groups.items)}
+  <h2>Nodes</h2>${nodesTable(nodes.items.slice(0, 8))}`;
+}
+
+function groupsTable(items) {
+  if (!items.length) return `<div class="card empty">No container groups. <a href="#/deploy">Deploy one</a>.</div>`;
+  return `<table><thead><tr><th>Name</th><th>Status</th><th>Ready</th><th>Priority</th><th>Image</th><th>GPU</th><th>Gateway</th><th>Queue</th></tr></thead><tbody>${items.map(g => {
+    const c = g.current_state.instance_status_counts, r = g.container.resources;
+    const gpu = (r.gpu_count || (r.gpu_classes||[]).length || r.min_vram_mb) ? `${r.gpu_count || 1}× ${(r.gpu_classes||[]).join('|') || (r.min_vram_mb ? '≥' + gb(r.min_vram_mb) + 'GB' : 'any')}${r.gpu_shared ? ' shared' : ''}` : 'cpu';
+    return `<tr><td><a href="#/groups/${encodeURIComponent(g.name)}"><b>${esc(g.name)}</b></a></td><td>${statusPill(g.current_state.status)}${g.pending_change ? ' <span class="pill info">updating</span>' : ''}</td><td>${c.ready_count}/${g.desired_replicas}</td><td>${esc(g.priority)}</td><td class="mono">${esc(g.container.image)}</td><td>${esc(gpu)}</td><td>${g.gateway_url ? `<a class="mono" href="${esc(g.gateway_url)}" target="_blank">${esc(g.gateway_url.replace(/^https?:\/\//, ''))}</a>` : '<span class="mute">-</span>'}</td><td>${g.queue_connection ? esc(g.queue_connection.queue_name) + (g.queue_stats ? ` <span class="mute">(${g.queue_stats.pending} pending)</span>` : '') : '<span class="mute">-</span>'}</td></tr>`;
+  }).join('')}</tbody></table>`;
+}
+
+async function viewGroups() {
+  const groups = await api('GET', `/v1/projects/${PROJECT}/containers`);
+  $('#app').innerHTML = `<div class="row"><h1>Container groups</h1><span class="sp"></span><a class="btn" href="#/deploy">+ Deploy</a></div>${groupsTable(groups.items)}`;
+}
+
+let groupTab = 'instances';
+async function viewGroup(name) {
+  const g = await api('GET', `/v1/projects/${PROJECT}/containers/${encodeURIComponent(name)}`);
+  const c = g.current_state.instance_status_counts, r = g.container.resources;
+  const keepLogs = $('#logbox') && groupTab === 'logs' && $('#logbox').dataset.group === name;
+  const head = `<div class="row"><h1>${esc(g.name)}</h1>${statusPill(g.current_state.status)}${g.pending_change ? '<span class="pill info">rolling update</span>' : ''}<span class="sp"></span>
+    <label class="mute">replicas</label><input id="rep" type="number" min="0" value="${g.desired_replicas}" style="width:80px" ${g.queue_autoscaler ? 'disabled title="managed by queue autoscaler"' : ''}><button id="scale">Scale</button>
+    ${g.current_state.status === 'stopped' || g.current_state.status === 'succeeded' ? '<button class="primary" id="start">Start</button>' : '<button id="stop">Stop</button>'}<button class="danger" id="del">Delete</button></div>
+    ${g.current_state.description ? `<p class="warn">${esc(g.current_state.description)}</p>` : ''}
+    <div class="grid g2" style="margin-top:10px"><div class="card kv">
+      <div>Image</div><div class="mono">${esc(g.container.image)}</div>
+      <div>Resources</div><div>${r.cpu} vCPU · ${gb(r.memory_mb)} GB RAM · ${r.gpu_count ? `${r.gpu_count}× GPU ${(r.gpu_classes||[]).join('|') || ''}${r.min_vram_mb ? ' ≥' + gb(r.min_vram_mb) + 'GB' : ''}` : 'no GPU'} · ${r.storage_gb} GB disk</div>
+      <div>Priority</div><div>${esc(g.priority)}</div><div>Version</div><div>${g.version}</div><div>Owner</div><div>${esc(g.owner)}</div>
+      <div>Countries</div><div>${(g.country_codes||[]).join(', ') || 'any'}</div>
+    </div><div class="card kv">
+      <div>Replicas</div><div>${c.ready_count} ready · ${c.running_count} running · ${c.creating_count + c.downloading_count} starting · ${c.allocating_count} allocating · ${c.stopping_count} stopping</div>
+      <div>Gateway</div><div>${g.gateway_url ? `<a class="mono" target="_blank" href="${esc(g.gateway_url)}">${esc(g.gateway_url)}</a><br><span class="mute">${esc(g.networking.load_balancer)} · ${g.networking.auth ? 'auth required (OGM-Api-Key, Bearer, or ?ogm_token=)' : 'public'}${g.networking.single_connection_limit ? ' · single connection' : ''}</span>` : '<span class="mute">disabled</span>'}</div>
+      ${g.gateway_token ? `<div>Share token</div><div><span class="mono" style="user-select:all">${esc(g.gateway_token)}</span> <a href="#" id="rotgw">rotate</a><br><span class="mute">works only for this endpoint</span></div>` : ''}
+      <div>Queue</div><div>${g.queue_connection ? `<a href="#/queues/${encodeURIComponent(g.queue_connection.queue_name)}">${esc(g.queue_connection.queue_name)}</a> → :${g.queue_connection.port}${esc(g.queue_connection.path)} ${g.queue_stats ? `<span class="mute">(${g.queue_stats.pending} pending, ${g.queue_stats.running} running)</span>` : ''}` : '<span class="mute">none</span>'}</div>
+      <div>Autoscaler</div><div>${g.queue_autoscaler ? `${g.queue_autoscaler.min_replicas}–${g.queue_autoscaler.max_replicas} replicas, ${g.queue_autoscaler.desired_queue_length} jobs/replica` : (g.scheduled_scaling_enabled ? 'scheduled' : '<span class="mute">manual</span>')}</div>
+    </div></div>
+    <div class="tabs">${['instances', 'events', 'logs', 'spec'].map(t => `<a href="#" data-tab="${t}" class="${groupTab === t ? 'on' : ''}">${t}</a>`).join('')}</div><div id="tab"></div>`;
+  const base = `/v1/projects/${PROJECT}/containers/${encodeURIComponent(name)}`;
+  const bind = () => {
+    $('#scale') && ($('#scale').onclick = async () => { try { await api('PATCH', base, {replicas: +$('#rep').value}); toast('scaled'); route(); } catch (e) { toast(e.message, true); } });
+    $('#start') && ($('#start').onclick = async () => { await api('POST', base + '/start'); route(); });
+    $('#stop') && ($('#stop').onclick = async () => { await api('POST', base + '/stop'); route(); });
+    $('#rotgw') && ($('#rotgw').onclick = async e => { e.preventDefault(); if (confirm('Rotate the share token? The old one stops working immediately.')) { await api('POST', base + '/rotate-gateway-token'); viewGroup(name); } });
+    $('#del').onclick = async () => { if (confirm(`Delete ${name}?`)) { await api('DELETE', base); location.hash = '#/groups'; } };
+  };
+  if (keepLogs) { $('#ghead').innerHTML = head.replace(/<div class="tabs">[\s\S]*$/, ''); bind(); return; }
+  $('#app').innerHTML = `<div id="ghead">${head.replace(/<div class="tabs">[\s\S]*$/, '')}</div>` + head.match(/<div class="tabs">[\s\S]*$/)[0];
+  bind();
+  document.querySelectorAll('[data-tab]').forEach(a => a.onclick = e => { e.preventDefault(); groupTab = a.dataset.tab; if (abortLogs) { abortLogs.abort(); abortLogs = null; } viewGroup(name); });
+  const tab = $('#tab');
+  if (groupTab === 'instances') {
+    tab.innerHTML = (g.instances||[]).length ? `<table><thead><tr><th>Instance</th><th>State</th><th>Ready</th><th>Node</th><th>GPU</th><th>GPU util</th><th>CPU / Mem</th><th>Jobs / conns</th><th>Del. cost</th><th>Up</th><th>Message</th><th></th></tr></thead><tbody>${g.instances.map(i => `<tr><td class="mono">${esc(i.id)}<br><span class="mute">v${i.version}</span></td><td>${statusPill(i.state)}${i.state === 'downloading' && i.pulling_progress ? ` ${i.pulling_progress.toFixed(0)}%` : ''}</td><td>${i.ready ? '<span class="ok">●</span>' : '<span class="mute">○</span>'}</td><td>${esc(i.node_name || '-')} <span class="mute">${esc(i.country || '')}</span></td><td>${esc(i.gpu_name || '-')}</td><td>${i.gpu_name ? `${i.metrics.gpu_util_percent.toFixed(0)}% · ${i.metrics.gpu_temp_c.toFixed(0)}°C` : '-'}</td><td>${i.metrics.cpu_percent.toFixed(0)}% · ${i.metrics.memory_usage_mb.toFixed(0)} MB</td><td>${i.metrics.inflight_jobs} / ${i.metrics.inflight_gateway_requests}</td><td>${i.deletion_cost}</td><td>${ago(i.running_time)}</td><td class="wrap mute" style="max-width:260px">${esc(i.message || '')}</td>
+      <td>${i.node_id ? `<button data-act="restart" data-id="${i.id}">restart</button> <button data-act="reallocate" data-id="${i.id}">reallocate</button>` : ''}</td></tr>`).join('')}</tbody></table>` : `<div class="card empty">No instances.</div>`;
+    tab.querySelectorAll('[data-act]').forEach(b => b.onclick = async () => { try { await api('POST', `${base}/instances/${b.dataset.id}/${b.dataset.act}`); toast(b.dataset.act + ' requested'); } catch (e) { toast(e.message, true); } });
+  } else if (groupTab === 'events') {
+    const ev = await api('GET', base + '/events?limit=300');
+    tab.innerHTML = `<table><thead><tr><th>Time</th><th>Instance</th><th>Event</th></tr></thead><tbody>${ev.items.map(e => `<tr><td class="mute">${new Date(e.time).toLocaleString()}</td><td class="mono">${esc(e.instance_id || '-')}</td><td class="wrap">${esc(e.message)}</td></tr>`).join('')}</tbody></table>`;
+  } else if (groupTab === 'logs') {
+    tab.innerHTML = `<div class="row" style="margin-bottom:8px"><input id="lq" placeholder="filter…" style="width:260px"><span class="mute">live tail</span></div><div class="logs" id="logbox" data-group="${esc(name)}"></div>`;
+    const box = $('#logbox');
+    const start = () => {
+      if (abortLogs) abortLogs.abort();
+      abortLogs = new AbortController(); box.innerHTML = '';
+      const q = $('#lq').value;
+      fetch(`${base}/logs?follow=1&limit=300${q ? '&q=' + encodeURIComponent(q) : ''}`, {headers: {'OGM-Api-Key': KEY}, signal: abortLogs.signal}).then(async r => {
+        const rd = r.body.getReader(), dec = new TextDecoder(); let buf = '';
+        for (;;) { const {value, done} = await rd.read(); if (done) break; buf += dec.decode(value, {stream: true});
+          let i; while ((i = buf.indexOf('\n\n')) >= 0) { const chunk = buf.slice(0, i); buf = buf.slice(i + 2);
+            if (!chunk.startsWith('data: ')) continue; const l = JSON.parse(chunk.slice(6));
+            const stick = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
+            box.insertAdjacentHTML('beforeend', `<div class="${l.stream === 'stderr' ? 'e' : ''}"><span class="t">${new Date(l.time).toLocaleTimeString()}</span> <span class="i">${esc(l.instance_id.slice(-6))}</span> ${esc(l.line)}</div>`);
+            if (box.childElementCount > 2000) box.firstChild.remove();
+            if (stick) box.scrollTop = box.scrollHeight; } }
+      }).catch(() => {});
+    };
+    let deb; $('#lq').oninput = () => { clearTimeout(deb); deb = setTimeout(start, 400); };
+    start();
+  } else {
+    const spec = Object.fromEntries(Object.entries(g).filter(([k]) => !['id','owner','version','current_state','desired_replicas','gateway_url','gateway_token','pending_change','create_time','update_time','instances','queue_stats'].includes(k)));
+    tab.innerHTML = `<p class="mute">Edit and apply (JSON merge patch semantics apply on the server via PUT).</p><textarea id="spec">${esc(JSON.stringify(spec, null, 2))}</textarea><div class="row" style="margin-top:8px"><button class="primary" id="apply">Apply</button></div>`;
+    $('#apply').onclick = async () => { try { await api('PUT', base, $('#spec').value); toast('applied'); groupTab = 'instances'; route(); } catch (e) { toast(e.message, true); } };
+  }
+}
+
+async function viewQueues() {
+  const qs = await api('GET', `/v1/projects/${PROJECT}/queues`);
+  $('#app').innerHTML = `<div class="row"><h1>Queues</h1><span class="sp"></span><input id="qn" placeholder="new-queue-name" style="width:220px"><button id="qc">Create queue</button></div>
+  ${qs.items.length ? `<table><thead><tr><th>Queue</th><th>Pending</th><th>Running</th><th>Succeeded</th><th>Failed</th><th>Cancelled</th><th>Groups</th><th>Retries</th></tr></thead><tbody>${qs.items.map(q => `<tr><td><a href="#/queues/${encodeURIComponent(q.name)}"><b>${esc(q.name)}</b></a></td><td class="${q.stats.pending ? 'warn' : ''}">${q.stats.pending}</td><td>${q.stats.running}</td><td class="ok">${q.stats.succeeded}</td><td class="${q.stats.failed ? 'bad' : ''}">${q.stats.failed}</td><td>${q.stats.cancelled}</td><td>${q.container_groups.map(esc).join(', ') || '<span class="mute">none</span>'}</td><td class="mute">${q.settings.max_attempts} attempts, backoff ${q.settings.retry_backoff_base_s}s→${q.settings.retry_backoff_max_s}s</td></tr>`).join('')}</tbody></table>` : `<div class="card empty">No queues yet.</div>`}`;
+  $('#qc').onclick = async () => { try { await api('POST', `/v1/projects/${PROJECT}/queues`, {name: $('#qn').value.trim()}); route(); } catch (e) { toast(e.message, true); } };
+}
+
+async function viewQueue(name) {
+  const base = `/v1/projects/${PROJECT}/queues/${encodeURIComponent(name)}`;
+  const [q, jobs] = await Promise.all([api('GET', base), api('GET', base + '/jobs?limit=100')]);
+  const keep = $('#jin') ? $('#jin').value : '{"prompt": "a cat in space"}';
+  $('#app').innerHTML = `<div class="row"><h1>${esc(q.name)}</h1><span class="pill">${q.stats.pending} pending</span><span class="pill info">${q.stats.running} running</span><span class="pill ok">${q.stats.succeeded} succeeded</span><span class="pill bad">${q.stats.failed} failed</span></div>
+  <div class="card" style="margin:12px 0"><div class="row"><input id="jin" style="flex:1;font-family:var(--mono)" value="${esc(keep)}"><button class="primary" id="sub">Submit job</button></div></div>
+  <table><thead><tr><th>Job</th><th>Status</th><th>Attempts</th><th>Instance</th><th>Created</th><th>Output / error</th><th></th></tr></thead><tbody>${jobs.items.map(j => `<tr><td class="mono">${esc(j.id)}</td><td>${statusPill(j.status)}</td><td>${j.attempts}/${j.max_attempts}</td><td class="mono">${esc(j.instance_id || '-')}</td><td>${ago(j.create_time)}</td><td class="wrap mono" style="max-width:520px">${j.error ? `<span class="bad">${esc(j.error)}</span>` : esc(JSON.stringify(j.output ?? '').slice(0, 220))}</td><td>${['pending','running'].includes(j.status) ? `<button data-cancel="${j.id}">cancel</button>` : ''}</td></tr>`).join('') || '<tr><td colspan="7" class="empty">no jobs</td></tr>'}</tbody></table>`;
+  $('#sub').onclick = async () => { try { await api('POST', base + '/jobs', {input: JSON.parse($('#jin').value)}); toast('submitted'); viewQueue(name); } catch (e) { toast(e.message, true); } };
+  document.querySelectorAll('[data-cancel]').forEach(b => b.onclick = async () => { try { await api('DELETE', base + '/jobs/' + b.dataset.cancel); viewQueue(name); } catch (e) { toast(e.message, true); } });
+}
+
+function nodesTable(items) {
+  if (!items.length) return `<div class="card empty">No nodes yet. Create a join token in <a href="#/settings">Settings</a> and run the agent on a GPU machine.</div>`;
+  return `<table><thead><tr><th>Node</th><th>Owner</th><th>Status</th><th>GPUs</th><th>CPU / RAM</th><th>Country</th><th>Instances</th><th>Uptime</th><th>Agent</th><th>Seen</th></tr></thead><tbody>${items.map(n => `<tr><td><b>${esc(n.name)}</b><br><span class="mono mute">${esc(n.id)}</span></td><td>${esc(n.owner)}</td><td>${statusPill(n.paused && n.status === 'online' ? 'paused' : n.status)}${n.pause_reason ? `<br><span class="mute">${esc(n.pause_reason)}</span>` : ''}</td>
+    <td class="wrap">${n.gpus.map(g => `<span class="gpu"><span class="dot ${g.util_percent > 80 ? 'warn' : 'ok'}"></span>${esc(g.name)} <span class="mute">${g.unified_memory ? 'unified ' : ''}${gb(g.mem_used_mb || 0)}/${gb(g.vram_mb)}G used · ${g.util_percent.toFixed(0)}% · ${g.temp_c.toFixed(0)}°C</span></span>`).join('<br>') || '<span class="mute">cpu only</span>'}</td>
+    <td>${n.cpu} · ${gb(n.memory_mb)}G</td><td>${esc(n.country || '-')}</td><td>${n.instances}</td><td>${(n.uptime_ratio*100).toFixed(0)}%</td><td class="mute">${esc(n.runtime || '')} ${esc(n.version || '')}</td><td>${ago(n.last_seen)}</td></tr>`).join('')}</tbody></table>`;
+}
+
+async function viewNodes() {
+  const nodes = await api('GET', '/v1/nodes');
+  $('#app').innerHTML = `<div class="row"><h1>Nodes</h1><span class="sp"></span><a class="btn" href="#/settings">+ Add a node</a></div>${nodesTable(nodes.items)}`;
+}
+
+async function viewMembers() {
+  const users = await api('GET', '/v1/users');
+  $('#app').innerHTML = `<h1>Members</h1><p class="hero">Credits flow from people running workloads to people contributing GPUs. Higher balance = scheduled first within a priority tier.</p>
+  <table><thead><tr><th>#</th><th>Member</th><th>Role</th><th>Nodes</th><th>Contributed</th><th>Consumed</th><th>Balance</th><th>Joined</th></tr></thead><tbody>${users.items.map((u, i) => `<tr><td>${i + 1}</td><td><b>${esc(u.name)}</b></td><td>${esc(u.role)}</td><td>${u.nodes || 0}</td><td class="ok">${(u.contributed_credits||0).toFixed(2)}</td><td>${(u.consumed_credits||0).toFixed(2)}</td><td><b>${u.credits.toFixed(2)}</b></td><td>${ago(u.create_time)} ago</td></tr>`).join('')}</tbody></table>`;
+}
+
+const EXAMPLE = {name: 'my-app', replicas: 2, priority: 'low', container: {image: 'ogm/demo', resources: {cpu: 2, memory_mb: 4096, gpu_count: 1, min_vram_mb: 8000}},
+  networking: {port: 8080, auth: true, load_balancer: 'least_number_of_connections'}, readiness_probe: {http: {path: '/health', port: 8080}}};
+async function viewDeploy() {
+  $('#app').innerHTML = `<h1>Deploy a container group</h1><p class="hero">JSON spec (the CLI accepts the same fields as YAML: <span class="mono">ogm deploy -f app.yaml</span>). Deploying an existing name updates it in place.</p>
+  <div class="grid g2"><div><textarea id="spec" style="min-height:420px">${esc(JSON.stringify(EXAMPLE, null, 2))}</textarea><div class="row" style="margin-top:10px"><button class="primary" id="dep">Deploy to ${esc(PROJECT)}</button></div></div>
+  <div class="card"><b>Cheat sheet</b><pre>{
+  "name": "sdxl",                    // dns label
+  "replicas": 3,
+  "priority": "high|medium|low|batch",
+  "country_codes": ["us","ca"],
+  "node_selector": {"tier": "fast"},
+  "container": {
+    "image": "ghcr.io/me/app:latest",
+    "command": ["python","serve.py"],
+    "env": {"KEY": "value"},
+    "registry_auth": {"username":"u","password":"p"},
+    "resources": {"cpu":4, "memory_mb":16384,
+      "gpu_count":1, "gpu_classes":["rtx-4090"],
+      "min_vram_mb":20000, "storage_gb":50}
+  },
+  "networking": {"port":8080, "auth":true,
+    "load_balancer":"round_robin",
+    "single_connection_limit":false,
+    "server_response_timeout_ms":600000},
+  "startup_probe":  {"http":{"path":"/health","port":8080}},
+  "readiness_probe":{"http":{"path":"/ready","port":8080}},
+  "liveness_probe": {"tcp":{"port":8080}},
+  "queue_connection": {"queue_name":"jobs",
+    "port":8080, "path":"/generate", "concurrency":1},
+  "queue_autoscaler": {"min_replicas":0, "max_replicas":20,
+    "desired_queue_length":4, "polling_period":30},
+  "scaling_actions": [{"schedule":"0 9 * * 1-5","replicas":10}],
+  "restart_policy": "always|on_failure|never"
+}</pre></div></div>`;
+  $('#dep').onclick = async () => { try { const s = JSON.parse($('#spec').value); const g = await api('PUT', `/v1/projects/${PROJECT}/containers/${encodeURIComponent(s.name)}`, s); toast('deployed ' + g.name); location.hash = '#/groups/' + encodeURIComponent(g.name); } catch (e) { toast(e.message, true); } };
+}
+
+async function viewSettings() {
+  const [me, ci] = await Promise.all([api('GET', '/v1/me'), api('GET', '/v1/cluster')]);
+  $('#app').innerHTML = `<h1>Settings</h1>
+  <div class="grid g2">
+  <div class="card"><b>Contribute a GPU machine</b><p class="mute">Creates a node token. Run the command on a Linux box with Docker + NVIDIA Container Toolkit.</p>
+    <div class="row"><input id="nn" placeholder="node name, e.g. alice-4090" style="flex:1"><button class="primary" id="nadd">Create token</button></div><pre id="nout" style="display:none"></pre></div>
+  <div class="card"><b>Invite friends</b>${me.role === 'admin' ? `<p class="mute">Each invite code can be used N times.</p><div class="row"><input id="iu" type="number" value="10" style="width:90px"><span class="mute">uses</span><button class="primary" id="inv">Create invite</button></div><pre id="iout" style="display:none"></pre>` : '<p class="mute">Ask an admin for an invite code.</p>'}</div>
+  <div class="card"><b>CLI</b><pre>ogm login ${esc(ci.public_url)} --key ${esc(KEY.slice(0, 8))}…</pre><button id="rot">Rotate my API key</button></div>
+  <div class="card"><b>New project</b><div class="row" style="margin-top:8px"><input id="pn" placeholder="project-name" style="flex:1"><button id="padd">Create</button></div></div>
+  </div>`;
+  $('#nadd').onclick = async () => { try { const t = await api('POST', '/v1/nodes', {name: $('#nn').value.trim()}); const o = $('#nout'); o.style.display = 'block';
+    o.textContent = `# one-line installer (systemd):\n${t.install_command}\n\n# or run directly:\nogm agent --server ${ci.public_url} --token ${t.token}`; } catch (e) { toast(e.message, true); } };
+  $('#inv') && ($('#inv').onclick = async () => { try { const i = await api('POST', '/v1/invites', {uses: +$('#iu').value}); const o = $('#iout'); o.style.display = 'block'; o.textContent = `code: ${i.code}\n\n${i.join_command}\n\n(or paste the code on the sign-in page)`; } catch (e) { toast(e.message, true); } });
+  $('#rot').onclick = async () => { if (!confirm('Rotate your API key? The old key stops working.')) return; const u = await api('POST', '/v1/me/rotate-key'); KEY = u.api_key; localStorage.setItem('ogm_key', KEY); alert('New API key:\n\n' + KEY); };
+  $('#padd').onclick = async () => { try { await api('POST', '/v1/projects', {name: $('#pn').value.trim()}); PROJECT = $('#pn').value.trim(); localStorage.setItem('ogm_project', PROJECT); route(); } catch (e) { toast(e.message, true); } };
+}
+
+window.addEventListener('hashchange', route);
+route();
+</script>
+</body>
+</html>

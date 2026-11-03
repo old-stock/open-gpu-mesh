@@ -1,0 +1,20 @@
+# Shared ComfyUI for the group: one GPU, browser UI + websocket through the gateway.
+# single_connection_limit sends each request to an instance with no request in flight;
+# with several replicas, everyone gets their own GPU.
+name: comfy
+replicas: 1
+priority: medium
+container:
+  image: ghcr.io/ai-dock/comfyui:latest
+  env:
+    WEB_ENABLE_AUTH: "false"         # the ogm gateway already does auth
+    CF_QUICK_TUNNELS: "false"
+  resources: { cpu: 6, memory_mb: 24576, gpu_count: 1, min_vram_mb: 16000, storage_gb: 80 }
+networking:
+  port: 8188
+  auth: true                         # browse with ?ogm_token=$OGM_API_KEY once; cookies are not needed for /ws
+  load_balancer: round_robin
+startup_probe:
+  tcp: { port: 8188 }
+  period_seconds: 10
+  failure_threshold: 90

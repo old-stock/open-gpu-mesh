@@ -1,0 +1,16 @@
+# Run-to-completion batch: 10 containers each render a 10-frame slice, then exit.
+# restart_policy: on_failure => crashes restart in place; exit 0 marks the slice done.
+# Each instance gets a stable OGM_REPLICA_INDEX (0..9). If a node drops out, the replacement
+# inherits the same index, and finished slices are never re-run. The group ends as "succeeded".
+# Inputs/outputs go through the cluster file store with presigned URLs:
+#   ogm files put scene.blend frames/scene.blend && export SCENE_URL=$(ogm files sign frames/scene.blend)
+name: render
+replicas: 10
+priority: batch
+restart_policy: on_failure
+container:
+  image: linuxserver/blender:latest
+  command: ["sh", "-c", "curl -fsS \"$SCENE_URL\" -o /tmp/scene.blend && blender -b /tmp/scene.blend -E CYCLES -s $((OGM_REPLICA_INDEX*10+1)) -e $((OGM_REPLICA_INDEX*10+10)) -a -- --cycles-device OPTIX"]
+  env:
+    SCENE_URL: ${SCENE_URL}
+  resources: { cpu: 4, memory_mb: 8192, gpu_count: 1, storage_gb: 20 }

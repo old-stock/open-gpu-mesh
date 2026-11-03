@@ -1,0 +1,25 @@
+# The built-in demo app. Works on `ogm dev` (process runtime) and on real Docker nodes.
+#   ogm deploy -f examples/hello.yaml
+#   curl $(ogm url hello)/generate -d '{"prompt":"a cat in space"}'
+#   ogm job submit hello-jobs --input '{"prompt":"a dog"}' --wait
+kind: queue
+name: hello-jobs
+settings:
+  max_attempts: 3
+  retry_backoff_base_s: 2
+---
+name: hello
+replicas: 2
+priority: medium
+container:
+  image: ogm/demo
+  resources: { cpu: 1, memory_mb: 1024, gpu_count: 1 }
+networking:
+  port: 8080
+  auth: false
+readiness_probe:
+  http: { path: /health, port: 8080 }
+queue_connection:
+  queue_name: hello-jobs
+  port: 8080
+  path: /generate

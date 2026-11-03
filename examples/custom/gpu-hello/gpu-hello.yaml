@@ -1,0 +1,14 @@
+# Built on each architecture and merged:  ogm push --multiarch gpu-hello:v1   (run on x86 and on ARM)
+kind: queue
+name: hello-work
+settings: { max_attempts: 3, retry_backoff_base_s: 2 }
+---
+name: gpu-hello
+replicas: 2
+priority: medium
+container:
+  image: registry.ogm/default/gpu-hello:v1
+  resources: { cpu: 1, memory_mb: 256, gpu_count: 1, storage_gb: 1 }
+networking: { port: 8080, auth: true }
+readiness_probe: { http: { path: /health, port: 8080 } }
+queue_connection: { queue_name: hello-work, port: 8080, path: /work, concurrency: 2 }

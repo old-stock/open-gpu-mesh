@@ -1,0 +1,9 @@
+name: tiny-llm
+replicas: 1
+priority: medium
+container:
+  image: registry.ogm/default/tiny-llm:v1
+  resources: { cpu: 4, memory_mb: 4096, gpu_count: 1, min_vram_mb: 1500, storage_gb: 10 }
+networking: { port: 8080, auth: true, server_response_timeout_ms: 300000 }
+startup_probe: { http: { path: /health, port: 8080 }, period_seconds: 2, failure_threshold: 90 }
+readiness_probe: { http: { path: /health, port: 8080 } }

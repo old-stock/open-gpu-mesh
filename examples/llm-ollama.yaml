@@ -1,0 +1,26 @@
+# Chat API backed by Ollama on any friend's GPU with >= 12 GB VRAM.
+#   ogm deploy -f examples/llm-ollama.yaml
+#   curl -H "OGM-Api-Key: $OGM_API_KEY" $(ogm url ollama)/api/generate -d '{"model":"llama3.1:8b","prompt":"hi"}'
+name: ollama
+replicas: 2
+priority: high
+container:
+  image: ollama/ollama:latest
+  # Start the server, pull the model once, then keep serving.
+  command: ["sh", "-c", "ollama serve & until ollama list >/dev/null 2>&1; do sleep 1; done; ollama pull ${MODEL:-llama3.1:8b}; wait"]
+  env:
+    MODEL: llama3.1:8b
+    OLLAMA_KEEP_ALIVE: "-1"
+  resources: { cpu: 4, memory_mb: 16384, gpu_count: 1, min_vram_mb: 12000, storage_gb: 30 }
+networking:
+  port: 11434
+  auth: true
+  load_balancer: least_number_of_connections
+  server_response_timeout_ms: 600000   # long generations are fine; no 100 s cap
+startup_probe:
+  # Ready only once the model is pulled.
+  exec: { command: ["sh", "-c", "ollama list | grep -q llama3.1"] }
+  period_seconds: 10
+  failure_threshold: 180
+readiness_probe:
+  http: { path: /api/tags, port: 11434 }

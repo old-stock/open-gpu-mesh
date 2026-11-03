@@ -1,0 +1,37 @@
+# Image generation as a job queue that scales with demand (0 -> 20 GPUs).
+# Your image only needs an HTTP endpoint: the ogm agent POSTs each job's input to
+# :8080/generate and stores whatever JSON you return. No worker binary to bake in.
+#   ogm job submit sdxl --input '{"prompt":"a lighthouse at dusk"}' --wait
+kind: queue
+name: sdxl
+settings:
+  max_attempts: 5
+  retry_backoff_base_s: 5
+  retry_backoff_max_s: 120
+  job_timeout_s: 300
+  retention_hours: 168
+---
+name: sdxl
+replicas: 0
+priority: batch          # cheapest tier; yields to interactive work, jobs are retried elsewhere
+container:
+  image: ghcr.io/YOUR_ORG/sdxl-http:latest
+  registry_auth:
+    server: ghcr.io
+    username: ${GHCR_USER}
+    password: ${GHCR_TOKEN}
+  resources: { cpu: 4, memory_mb: 16384, gpu_count: 1, min_vram_mb: 10000, storage_gb: 40 }
+readiness_probe:
+  http: { path: /health, port: 8080 }
+queue_connection:
+  queue_name: sdxl
+  port: 8080
+  path: /generate
+  concurrency: 1
+queue_autoscaler:
+  min_replicas: 0
+  max_replicas: 20
+  desired_queue_length: 3
+  polling_period: 15
+  max_upscale_per_minute: 10
+  max_downscale_per_minute: 2

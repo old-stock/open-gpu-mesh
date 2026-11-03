@@ -1,0 +1,26 @@
+# OpenAI-compatible endpoint with vLLM. Point any OpenAI SDK at $(ogm url qwen)/v1.
+#   export OPENAI_BASE_URL=$(ogm url qwen)/v1 OPENAI_API_KEY=$OGM_API_KEY
+name: qwen
+replicas: 1
+priority: high
+country_codes: [us, ca]
+container:
+  image: vllm/vllm-openai:latest
+  command: ["vllm", "serve", "Qwen/Qwen2.5-7B-Instruct", "--max-model-len", "8192", "--gpu-memory-utilization", "0.9"]
+  env:
+    HF_TOKEN: ${HF_TOKEN}            # expanded from your shell at deploy time
+  resources: { cpu: 8, memory_mb: 32768, gpu_count: 1, gpu_classes: [rtx-4090, rtx-3090, a6000], storage_gb: 60, shm_mb: 8192 }
+networking:
+  port: 8000
+  auth: true                         # Bearer $OGM_API_KEY works, so OpenAI SDKs just work
+  server_response_timeout_ms: 900000
+startup_probe:
+  http: { path: /health, port: 8000 }
+  period_seconds: 10
+  failure_threshold: 120
+readiness_probe:
+  http: { path: /health, port: 8000 }
+scheduled_scaling_enabled: true
+scaling_actions:                     # cheaper at night: scale to zero 01:00-08:00
+  - { schedule: "0 1 * * *", replicas: 0 }
+  - { schedule: "0 8 * * *", replicas: 1 }
