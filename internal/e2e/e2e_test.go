@@ -88,7 +88,13 @@ func newCluster(t *testing.T) *cluster {
 
 func (cl *cluster) addAgent(name, gpus string) {
 	cl.t.Helper()
-	tok, err := cl.c.CreateNode(cl.ctx, name)
+	cl.addAgentAs(cl.c, name, gpus)
+}
+
+// addAgentAs starts an agent for a node registered by the given user's client.
+func (cl *cluster) addAgentAs(c *client.Client, name, gpus string) {
+	cl.t.Helper()
+	tok, err := c.CreateNode(cl.ctx, name)
 	if err != nil {
 		cl.t.Fatal(err)
 	}

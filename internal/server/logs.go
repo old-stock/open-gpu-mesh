@@ -206,6 +206,11 @@ func (s *Server) handleIMDS(nodeID string, req proto.IMDSRequest) (*proto.IMDSRe
 		if len(aud) > 256 || strings.ContainsAny(aud, " \t\r\n\"") {
 			return nil, errors.New("invalid audience")
 		}
+		if aud == jwtAudHub && !g.Spec.AllowUntrustedNodes {
+			if n, err := s.st.NodeByID(nodeID); err != nil || !s.nodeTrustedFor(n, in.Project) {
+				return nil, errors.New("hub tokens are only issued on nodes trusted for project " + in.Project + " (see allow_untrusted_nodes)")
+			}
+		}
 		now := time.Now()
 		jwt, err := webhook.SignJWT(s.jwtPriv, s.jwtKid, map[string]any{
 			"iss": s.cfg.PublicURL, "sub": in.ID, "aud": aud,

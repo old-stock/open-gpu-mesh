@@ -74,3 +74,17 @@ func TestVolumeNameNoCollision(t *testing.T) {
 		t.Fatal("volume names collide across projects")
 	}
 }
+
+func TestGatewayBase(t *testing.T) {
+	c := Config{PublicURL: "https://gpu.example.com", GatewayListen: ":7778"}
+	if got := c.gatewayBase(); got != "http://gpu.example.com:7778" {
+		t.Fatal(got)
+	}
+	c.GatewayURL = "https://apps.example.com/"
+	if got := c.gatewayBase(); got != "https://apps.example.com" {
+		t.Fatal(got)
+	}
+	if (&Config{PublicURL: "https://gpu.example.com"}).gatewayBase() != "" {
+		t.Fatal("gateway base without a gateway listener")
+	}
+}

@@ -36,6 +36,8 @@ func cmdServer(e *env, args []string) {
 	data := fs.String("data", envOr("OGM_DATA", "./ogm-data"), "data directory (SQLite db + files)")
 	public := fs.String("public-url", os.Getenv("OGM_PUBLIC_URL"), "externally reachable URL, e.g. https://gpu.example.com")
 	gwDomain := fs.String("gateway-domain", os.Getenv("OGM_GATEWAY_DOMAIN"), "wildcard domain for {group}-{project}.DOMAIN gateway routing (optional)")
+	gwListen := fs.String("gateway-listen", os.Getenv("OGM_GATEWAY_LISTEN"), "serve workloads (/gw/...) on their own listener, e.g. :7778, so they get an origin separate from the API and dashboard")
+	gwURL := fs.String("gateway-url", os.Getenv("OGM_GATEWAY_URL"), "public base URL of --gateway-listen (default: the public URL's host on that port)")
 	tlsOn := fs.Bool("tls", os.Getenv("OGM_TLS") == "1", "automatic HTTPS via Let's Encrypt on :443 (+ :80 for challenges/redirect) for the public URL host and custom domains")
 	acmeEmail := fs.String("acme-email", os.Getenv("OGM_ACME_EMAIL"), "contact email for Let's Encrypt (with --tls)")
 	name := fs.String("name", envOr("OGM_CLUSTER_NAME", "open-gpu-mesh"), "cluster name shown in the dashboard")
@@ -45,7 +47,7 @@ func cmdServer(e *env, args []string) {
 	level := fs.String("log-level", "info", "debug|info|warn|error")
 	parse(fs, args)
 	srv, err := server.New(server.Config{
-		DataDir: *data, Listen: *listen, PublicURL: *public, GatewayDomain: *gwDomain, ClusterName: *name, TLS: *tlsOn, ACMEEmail: *acmeEmail,
+		DataDir: *data, Listen: *listen, PublicURL: *public, GatewayDomain: *gwDomain, GatewayListen: *gwListen, GatewayURL: *gwURL, ClusterName: *name, TLS: *tlsOn, ACMEEmail: *acmeEmail,
 		DistDir: *dist, StarterCredits: *starter, Logger: logger(*level),
 	})
 	check(err)

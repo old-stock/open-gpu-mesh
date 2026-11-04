@@ -56,6 +56,10 @@ type ContainerGroupSpec struct {
 	ScalingActions          []ScalingAction   `json:"scaling_actions,omitempty" yaml:"scaling_actions,omitempty"`
 	ScheduledScalingEnabled bool              `json:"scheduled_scaling_enabled,omitempty" yaml:"scheduled_scaling_enabled,omitempty"`
 	Readme                  string            `json:"readme,omitempty" yaml:"readme,omitempty"`
+	// AllowUntrustedNodes lets a group that uses secrets run on nodes not trusted for
+	// its project (their operators can read the secrets), and lets its instances get
+	// hub-audience identity tokens there.
+	AllowUntrustedNodes bool `json:"allow_untrusted_nodes,omitempty" yaml:"allow_untrusted_nodes,omitempty"`
 }
 
 // ContainerSpec describes the container image and its resource needs.
@@ -333,6 +337,7 @@ type Node struct {
 	UptimeRatio     float64           `json:"uptime_ratio"`
 	CreateTime      time.Time         `json:"create_time"`
 	Assessment      *Assessment       `json:"assessment,omitempty"` // latest onboarding audit
+	Trusted         bool              `json:"trusted"`              // admin-marked: may run any project's secrets
 }
 
 // Assessment is the onboarding audit of a machine (`ogm assess`): what it has, how fast it

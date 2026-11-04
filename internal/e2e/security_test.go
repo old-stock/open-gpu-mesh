@@ -1,11 +1,15 @@
 package e2e
 
 import (
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/old-stock/open-gpu-mesh/internal/api"
+	"github.com/old-stock/open-gpu-mesh/internal/client"
 )
 
 // TestSecurityHardening covers the protections added after the pre-release security review.
@@ -112,5 +116,89 @@ func TestSecurityHardening(t *testing.T) {
 		if _, err := cl.c.CreateGroup(ctx, "fresh", cpuSpec("big", 3)); !problemHas(err, "quota") {
 			t.Fatalf("default quota not enforced: %v", err)
 		}
+		_ = cl.c.Do(ctx, "PUT", "/v1/projects/*/quota", map[string]int{}, nil)
+	})
+
+	t.Run("secrets only go to trusted nodes", func(t *testing.T) {
+		var inv api.Invite
+		if err := cl.c.Do(ctx, "POST", "/v1/invites", map[string]any{"uses": 1}, &inv); err != nil {
+			t.Fatal(err)
+		}
+		var vol api.User
+		if err := cl.c.Do(ctx, "POST", "/v1/join", map[string]any{"code": inv.Code, "name": "volunteer"}, &vol); err != nil {
+			t.Fatal(err)
+		}
+		cl.addAgentAs(client.New(cl.url, vol.APIKey), "community", "")
+		eventually(t, 10*time.Second, "community node online", func() (bool, string) {
+			ns, _ := cl.c.Nodes(ctx)
+			return len(ns) == 1 && ns[0].Status == "online" && !ns[0].Trusted, fmt.Sprint(ns)
+		})
+		// Every user is a member of "default" (and could read its secrets anyway by
+		// deploying a group there), so use a project the volunteer is not in.
+		if err := cl.c.Do(ctx, "POST", "/v1/projects", map[string]string{"name": "private"}, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := cl.c.Do(ctx, "PUT", "/v1/projects/private/secrets/db-pass", map[string]string{"value": "hunter2"}, nil); err != nil {
+			t.Fatal(err)
+		}
+		s := cpuSpec("sek", 1)
+		s.Container.Env = map[string]string{"DB_PASS": "{{secret:db-pass}}"}
+		if _, err := cl.c.CreateGroup(ctx, "private", s); err != nil {
+			t.Fatal(err)
+		}
+		pub := cpuSpec("nosecret", 1)
+		if _, err := cl.c.CreateGroup(ctx, "private", pub); err != nil {
+			t.Fatal(err)
+		}
+		cl.waitReadyIn("private", "nosecret", 1) // groups without secrets still use community nodes
+		time.Sleep(2 * time.Second)
+		ins, _ := cl.c.Instances(ctx, "private", "sek")
+		for _, in := range ins {
+			if in.NodeID != "" {
+				b, _ := json.Marshal(ins)
+				t.Fatalf("secret group placed on an untrusted node: %s", b)
+			}
+		}
+		// The volunteer cannot trust their own node.
+		ns, _ := cl.c.Nodes(ctx)
+		if c, _, _ := cl.raw(vol.APIKey, "PATCH", "/v1/nodes/"+ns[0].ID, `{"trusted":true}`, nil); c != http.StatusForbidden {
+			t.Fatalf("owner self-trust: %d", c)
+		}
+		if err := cl.c.Do(ctx, "PATCH", "/v1/nodes/"+ns[0].ID, map[string]bool{"trusted": true}, nil); err != nil {
+			t.Fatal(err)
+		}
+		cl.waitReadyIn("private", "sek", 1)
+		_ = cl.c.DeleteGroup(ctx, "private", "sek")
+		_ = cl.c.DeleteGroup(ctx, "private", "nosecret")
+	})
+
+	t.Run("path gateway on the hub origin is sandboxed", func(t *testing.T) {
+		s := cpuSpec("page", 1)
+		s.Networking.Auth = false
+		if _, err := cl.c.CreateGroup(ctx, "default", s); err != nil {
+			t.Fatal(err)
+		}
+		cl.waitReady("page", 1)
+		c, _, h := cl.raw("", "GET", "/gw/default/page/health", "", nil)
+		if c != 200 || !strings.Contains(h.Get("Content-Security-Policy"), "sandbox allow-scripts") || strings.Contains(h.Get("Content-Security-Policy"), "allow-same-origin") {
+			t.Fatalf("gateway CSP: %d %v", c, h)
+		}
+		_ = cl.c.DeleteGroup(ctx, "default", "page")
+	})
+}
+
+// waitReadyIn waits for n ready instances of a group in project p.
+func (cl *cluster) waitReadyIn(p, group string, n int) {
+	cl.t.Helper()
+	eventually(cl.t, 30*time.Second, group+" ready", func() (bool, string) {
+		ins, _ := cl.c.Instances(cl.ctx, p, group)
+		c := 0
+		for _, in := range ins {
+			if in.Ready {
+				c++
+			}
+		}
+		b, _ := json.Marshal(ins)
+		return c == n, string(b)
 	})
 }

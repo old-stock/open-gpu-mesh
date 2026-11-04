@@ -182,6 +182,7 @@ Nodes & GPUs:
   ogm node add NAME                           create a join token + install command
   ogm node assessment NODE                    show the onboarding audit (hardware, speed, tier, advice)
   ogm node pause|resume|rm NODE_ID
+  ogm node trust|untrust NODE_ID              (admin) allow groups that use secrets on this node
   ogm gpus                                    GPU classes, availability and credit prices
 
 Images (built-in registry, no account needed):

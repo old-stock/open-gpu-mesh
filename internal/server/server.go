@@ -25,10 +25,15 @@ import (
 
 // Config configures a server.
 type Config struct {
-	DataDir           string        // where ogm.db and files live
-	Listen            string        // e.g. ":7777"
-	PublicURL         string        // externally reachable base URL, e.g. https://gpu.example.com
-	GatewayDomain     string        // optional wildcard domain for {group}-{project}.domain routing
+	DataDir       string // where ogm.db and files live
+	Listen        string // e.g. ":7777"
+	PublicURL     string // externally reachable base URL, e.g. https://gpu.example.com
+	GatewayDomain string // optional wildcard domain for {group}-{project}.domain routing
+	// GatewayListen serves the path gateway (/gw/{project}/{group}/) on its own listener,
+	// so workloads get an origin separate from the hub's API and dashboard. GatewayURL is
+	// its public base URL (default: the public URL's host on GatewayListen's port).
+	GatewayListen     string
+	GatewayURL        string
 	ClusterName       string        // shown in the dashboard
 	StarterCredits    float64       // credits granted to new users
 	DistDir           string        // optional dir with ogm-{os}-{arch} binaries for /dl
@@ -41,6 +46,22 @@ type Config struct {
 	// challenge listener, for the public URL's host and every networking.custom_domains entry.
 	TLS       bool
 	ACMEEmail string
+}
+
+// gatewayBase is the public base URL of the separate gateway listener, or "".
+func (c *Config) gatewayBase() string {
+	if c.GatewayURL != "" {
+		return strings.TrimRight(c.GatewayURL, "/")
+	}
+	if c.GatewayListen == "" {
+		return ""
+	}
+	_, port, err := net.SplitHostPort(c.GatewayListen)
+	u, perr := url.Parse(c.PublicURL)
+	if err != nil || perr != nil || u.Hostname() == "" {
+		return ""
+	}
+	return "http://" + net.JoinHostPort(u.Hostname(), port)
 }
 
 func (c *Config) defaults() {
@@ -156,6 +177,9 @@ func New(cfg Config) (*Server, error) {
 	}
 	if err := s.initSnapshots(); err != nil {
 		return nil, fmt.Errorf("snapshots: %w", err)
+	}
+	if err := s.initTrust(); err != nil {
+		return nil, err
 	}
 	if err := s.initQuotas(); err != nil {
 		return nil, fmt.Errorf("quotas: %w", err)
@@ -345,6 +369,18 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		s.hub.closeAll()
 		_ = srv.Shutdown(sctx)
 	}()
+	if s.cfg.GatewayListen != "" {
+		gln, err := net.Listen("tcp", s.cfg.GatewayListen)
+		if err != nil {
+			return fmt.Errorf("gateway listener: %w", err)
+		}
+		gsrv := &http.Server{Handler: s.GatewayHandler(), ReadHeaderTimeout: 30 * time.Second}
+		go func() { <-ctx.Done(); _ = gsrv.Close() }()
+		go func() { _ = gsrv.Serve(gln) }()
+		s.log.Info("gateway listening", "addr", gln.Addr().String(), "public_url", s.cfg.gatewayBase())
+	} else if s.cfg.GatewayDomain == "" {
+		s.log.Warn("workloads are served under /gw/ on the hub's own origin and are sandboxed (no cookies or storage); use --gateway-listen or --gateway-domain to give them their own origin")
+	}
 	s.log.Info("ogm server listening", "addr", ln.Addr().String(), "public_url", s.cfg.PublicURL)
 	err := srv.Serve(ln)
 	if errors.Is(err, http.ErrServerClosed) {
@@ -369,6 +405,9 @@ func (s *Server) gatewayURL(project, group string) string {
 			scheme = "http"
 		}
 		return fmt.Sprintf("%s://%s-%s.%s/", scheme, group, project, s.cfg.GatewayDomain)
+	}
+	if b := s.cfg.gatewayBase(); b != "" {
+		return fmt.Sprintf("%s/gw/%s/%s/", b, project, group)
 	}
 	return fmt.Sprintf("%s/gw/%s/%s/", s.cfg.PublicURL, project, group)
 }

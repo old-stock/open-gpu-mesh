@@ -2,6 +2,7 @@ package server
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -27,6 +28,11 @@ const (
 // It fails only when a referenced secret is missing or unreadable.
 func (s *Server) instanceSpec(g *store.GroupRow, in *store.InstanceRow) (*proto.InstanceSpec, error) {
 	sp := g.Spec
+	if needsTrustedNode(sp) && in.NodeID != "" {
+		if n, err := s.st.NodeByID(in.NodeID); err != nil || !s.nodeTrustedFor(n, g.Project) {
+			return nil, errors.New("secrets are only sent to nodes trusted for project " + g.Project + " (see allow_untrusted_nodes)")
+		}
+	}
 	env := map[string]string{}
 	links := map[proto.Link]bool{}
 	for k, v := range sp.Container.Env {
@@ -587,6 +593,9 @@ func (s *Server) eligible(n *store.NodeRow, g *store.GroupRow, banned map[string
 	}
 	if archs := s.imageArchs(sp.Container.Image); archs != nil && n.Info.Arch != "" && !archs[orDefault(n.Info.OS, "linux")+"/"+n.Info.Arch] {
 		return "image arch"
+	}
+	if needsTrustedNode(sp) && !s.nodeTrustedFor(n, g.Project) {
+		return "untrusted node (group uses secrets)"
 	}
 	if len(n.Info.AllowPriorities) > 0 && !contains(n.Info.AllowPriorities, sp.Priority) {
 		return "priority not allowed by owner"

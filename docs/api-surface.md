@@ -176,7 +176,7 @@ Every operation of the hub's HTTP API (134 operations). The full reference, with
 | `GET` | `/v1/nodes` | `listNodes` | List nodes | `ogm nodes` |
 | `POST` | `/v1/nodes` | `createNode` | Create a node join token | `ogm node add NAME` |
 | `GET` | `/v1/nodes/{node}` | `getNode` | Get a node |  |
-| `PATCH` | `/v1/nodes/{node}` | `updateNode` | Rename, pause or resume a node | `ogm node pause\|resume NODE_ID` |
+| `PATCH` | `/v1/nodes/{node}` | `updateNode` | Rename, pause or resume a node | `ogm node pause\|resume\|trust\|untrust NODE_ID` |
 | `DELETE` | `/v1/nodes/{node}` | `deleteNode` | Remove a node | `ogm node rm NODE_ID` |
 | `GET` | `/v1/nodes/{node}/assessment` | `getNodeAssessment` | Get a node's assessment | `ogm node assessment NODE` |
 | `GET` | `/v1/speedtest/ping` | `speedtestPing` | Speed test - latency probe | `ogm assess` |

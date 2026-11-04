@@ -370,7 +370,15 @@ func (gw *Gateway) serveInner(w http.ResponseWriter, r *http.Request, g *store.G
 	if strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ogm") { // never forward hub credentials
 		r.Header.Del("Authorization")
 	}
+	sandbox, _ := r.Context().Value(sandboxCtxKey{}).(bool)
 	proxy := &httputil.ReverseProxy{
+		ModifyResponse: func(resp *http.Response) error {
+			if sandbox {
+				resp.Header.Add("Content-Security-Policy", gwSandboxCSP) // combined with any CSP the app sends
+				resp.Header.Del("Service-Worker-Allowed")
+			}
+			return nil
+		},
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetXForwarded()
 			pr.Out.Host = pr.In.Host
@@ -429,6 +437,27 @@ func (gw *Gateway) authorize(r *http.Request, g *store.GroupRow) bool {
 	_ = gw.s.st.DB.QueryRow(`SELECT COUNT(*) FROM projects p LEFT JOIN project_members m ON m.project=p.name AND m.user_id=?
 		WHERE p.name=? AND (p.owner_id=? OR m.user_id IS NOT NULL)`, u.ID, g.Project, u.ID).Scan(&n)
 	return n > 0
+}
+
+type sandboxCtxKey struct{}
+
+// gwSandboxCSP runs workload pages served on the hub's own origin in an opaque origin:
+// scripts work, but they cannot read the dashboard's storage or make credentialed
+// same-origin requests to the hub API.
+const gwSandboxCSP = "sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-modals allow-downloads allow-presentation"
+
+// GatewayHandler serves only the path gateway; it runs on Config.GatewayListen.
+func (s *Server) GatewayHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/gw/"):
+			s.handlePathGateway(w, r)
+		case r.URL.Path == "/healthz":
+			_, _ = io.WriteString(w, "ok\n")
+		default:
+			problem(w, http.StatusNotFound, "not found", "this is the workload gateway; use /gw/{project}/{group}/...")
+		}
+	})
 }
 
 // handlePathGateway is /gw/{project}/{group}/...

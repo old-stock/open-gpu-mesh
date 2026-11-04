@@ -34,6 +34,7 @@ type DockerRuntime struct {
 	mu      sync.Mutex
 	cached  map[string]bool
 	orphans map[string]orphan // instance id -> running container from a previous agent process
+	nets    map[string]bool   // project networks known to exist
 }
 
 const dockerLabel = "dev.ogm.managed"
@@ -317,6 +318,15 @@ func (d *DockerRuntime) Cleanup(ctx context.Context) error {
 			r.Body.Close()
 		}
 	}
+	// Drop project networks no surviving container uses.
+	if resp, err := d.do(ctx, http.MethodGet, "/networks?filters="+url.QueryEscape(string(f)), nil, nil); err == nil {
+		var nets []struct{ Name string }
+		_ = json.NewDecoder(resp.Body).Decode(&nets)
+		resp.Body.Close()
+		for _, n := range nets {
+			d.pruneNetwork(ctx, n.Name)
+		}
+	}
 	// Seed the image cache list.
 	if resp, err := d.do(ctx, http.MethodGet, "/images/json", nil, nil); err == nil {
 		var imgs []struct{ RepoTags []string }
@@ -368,6 +378,17 @@ func (d *DockerRuntime) Create(ctx context.Context, spec StartSpec) (Container, 
 	if d.OCIRuntime != "" {
 		hostCfg["Runtime"] = d.OCIRuntime
 	}
+	// Each project gets its own bridge network. Docker isolates bridge networks from
+	// each other, so containers of different projects on one node cannot reach each
+	// other; they still reach the agent (IMDS, links) through host.docker.internal.
+	netName := ""
+	if p := spec.Labels["dev.ogm.project"]; p != "" {
+		netName = projectNetwork(p)
+		if err := d.ensureNetwork(ctx, netName, p); err != nil {
+			return nil, fmt.Errorf("project network %s: %w", netName, err)
+		}
+		hostCfg["NetworkMode"] = netName
+	}
 	if len(spec.Volumes) > 0 {
 		var mounts []map[string]any
 		for _, v := range spec.Volumes {
@@ -401,6 +422,16 @@ func (d *DockerRuntime) Create(ctx context.Context, spec StartSpec) (Container, 
 		}
 		resp, err = d.do(ctx, http.MethodPost, "/containers/create?name="+url.QueryEscape("ogm-"+spec.Name), body, nil)
 	}
+	if errors.As(err, &de) && de.Status == http.StatusNotFound && netName != "" {
+		// The project network was pruned between ensureNetwork and create (its last
+		// container just went away, e.g. during a rolling update): recreate it once.
+		d.mu.Lock()
+		delete(d.nets, netName)
+		d.mu.Unlock()
+		if nerr := d.ensureNetwork(ctx, netName, spec.Labels["dev.ogm.project"]); nerr == nil {
+			resp, err = d.do(ctx, http.MethodPost, "/containers/create?name="+url.QueryEscape("ogm-"+spec.Name), body, nil)
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -409,7 +440,7 @@ func (d *DockerRuntime) Create(ctx context.Context, spec StartSpec) (Container, 
 	}
 	_ = json.NewDecoder(resp.Body).Decode(&cr)
 	resp.Body.Close()
-	c := &dockerContainer{d: d, id: cr.ID, ports: map[int]string{}}
+	c := &dockerContainer{d: d, id: cr.ID, ports: map[int]string{}, net: netName}
 	if r, err := d.do(ctx, http.MethodPost, "/containers/"+cr.ID+"/start", nil, nil); err != nil {
 		_ = c.Remove(context.Background())
 		return nil, err
@@ -480,6 +511,7 @@ func (c *dockerContainer) resolvePorts(ctx context.Context) {
 type dockerContainer struct {
 	d         *DockerRuntime
 	id        string
+	net       string // project network, removed with its last container
 	ports     map[int]string
 	logsSince int64 // adopted containers: don't re-ship old logs
 }
@@ -555,6 +587,20 @@ func (c *dockerContainer) Remove(ctx context.Context) error {
 	resp, err := c.d.do(ctx, http.MethodDelete, "/containers/"+c.id+"?force=1&v=1", nil, nil)
 	if err == nil {
 		resp.Body.Close()
+	}
+	if c.net != "" {
+		// Docker can take a moment to release the endpoint after a forced removal.
+		go func(name string) {
+			for i := 0; i < 3; i++ {
+				pctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				gone := c.d.pruneNetwork(pctx, name)
+				cancel()
+				if gone {
+					return
+				}
+				time.Sleep(2 * time.Second)
+			}
+		}(c.net)
 	}
 	var de *dockerError
 	if errors.As(err, &de) && de.Status == http.StatusNotFound {
@@ -659,4 +705,57 @@ func (c *dockerContainer) Stats(ctx context.Context) (float64, float64, error) {
 		cpu = cd / sd * float64(n) * 100
 	}
 	return cpu, float64(s.MemoryStats.Usage) / (1 << 20), nil
+}
+
+// projectNetwork is the Docker network for a project's containers.
+func projectNetwork(project string) string { return "ogm-net-" + project }
+
+// ensureNetwork creates the project's bridge network if it does not exist yet.
+func (d *DockerRuntime) ensureNetwork(ctx context.Context, name, project string) error {
+	d.mu.Lock()
+	known := d.nets[name]
+	d.mu.Unlock()
+	if known {
+		return nil
+	}
+	if r, err := d.do(ctx, http.MethodGet, "/networks/"+url.PathEscape(name), nil, nil); err == nil {
+		r.Body.Close()
+	} else {
+		r, err := d.do(ctx, http.MethodPost, "/networks/create", map[string]any{
+			"Name": name, "Driver": "bridge", "CheckDuplicate": true,
+			"Labels": map[string]string{dockerLabel: "1", "dev.ogm.project": project},
+		}, nil)
+		var de *dockerError
+		if err != nil && !(errors.As(err, &de) && de.Status == http.StatusConflict) {
+			return err
+		}
+		if err == nil {
+			r.Body.Close()
+		}
+	}
+	d.mu.Lock()
+	if d.nets == nil {
+		d.nets = map[string]bool{}
+	}
+	d.nets[name] = true
+	d.mu.Unlock()
+	return nil
+}
+
+// pruneNetwork removes a project network once no container uses it (Docker refuses
+// while it is in use, which is fine), so idle projects don't hold address space.
+// It reports whether the network is gone.
+func (d *DockerRuntime) pruneNetwork(ctx context.Context, name string) bool {
+	r, err := d.do(ctx, http.MethodDelete, "/networks/"+url.PathEscape(name), nil, nil)
+	var de *dockerError
+	if err != nil && !(errors.As(err, &de) && de.Status == http.StatusNotFound) {
+		return false
+	}
+	if err == nil {
+		r.Body.Close()
+	}
+	d.mu.Lock()
+	delete(d.nets, name)
+	d.mu.Unlock()
+	return true
 }

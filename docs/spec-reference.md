@@ -15,6 +15,7 @@
 | `autostart_policy` | bool | true | yes | false = create stopped |
 | `country_codes` | [string] | any | yes | ISO alpha-2 codes, matched against the agent's `--country` |
 | `node_selector` | map | | yes | Matched against agent `--label k=v`. The built-in keys `arch` (`amd64`, `arm64`) and `os` are always available. |
+| `allow_untrusted_nodes` | bool | false | yes (new placements) | A group that references secrets runs only on nodes trusted for its project (owned by an admin, the project owner or a member, or marked with `ogm node trust`). Set true to allow any node; its operator can then read the secrets. See [security notes](services.md#security-notes). |
 | `container.image` | string | required | rolling | Any registry, or `registry.ogm/{project}/{name}:{tag}` for the [built-in registry](#built-in-image-registry) |
 | `container.image_pull_policy` | `always` \| `if_not_present` \| `never` | `always` for `:latest`/untagged, else `if_not_present` | rolling | If a pull fails but the image exists locally, the local copy is used (with an event) |
 | `container.command` | [string] | image default | rolling | replaces the image ENTRYPOINT+CMD |

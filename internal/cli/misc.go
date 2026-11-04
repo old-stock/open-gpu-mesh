@@ -148,7 +148,7 @@ func cmdNodes(e *env) {
 }
 
 func cmdNode(e *env, args []string) {
-	need(args, 1, "node add|pause|resume|rm|assessment ...")
+	need(args, 1, "node add|pause|resume|trust|untrust|rm|assessment ...")
 	c := e.client()
 	switch args[0] {
 	case "add":
@@ -170,6 +170,14 @@ func cmdNode(e *env, args []string) {
 		need(args, 2, "node "+args[0]+" NODE_ID")
 		check(c.Do(e.ctx, "PATCH", "/v1/nodes/"+args[1], map[string]bool{"paused": args[0] == "pause"}, nil))
 		fmt.Fprintf(e.out, "node %s %sd\n", args[1], args[0])
+	case "trust", "untrust":
+		need(args, 2, "node "+args[0]+" NODE_ID")
+		check(c.Do(e.ctx, "PATCH", "/v1/nodes/"+args[1], map[string]bool{"trusted": args[0] == "trust"}, nil))
+		if args[0] == "trust" {
+			fmt.Fprintf(e.out, "node %s is trusted: groups that use secrets may run on it\n", args[1])
+		} else {
+			fmt.Fprintf(e.out, "node %s is no longer trusted\n", args[1])
+		}
 	case "assessment", "audit":
 		need(args, 2, "node assessment NODE_ID")
 		var a api.Assessment

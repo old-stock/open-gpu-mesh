@@ -50,7 +50,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" "$OGM_SERVER_URL/v1/projects/$OGM
 
 Tokens last one hour and are rejected after the instance stops. To prove the workload's identity to your own services, fetch a token without `audience` (it defaults to `ogm-workload`) or with your service's name, and verify it against `/.well-known/jwks.json`, checking `aud`. Only `ogm-hub` tokens work against the hub, so a token you hand to another service never grants hub access. Send `ogm-hub` tokens only to the hub.
 
-A node operator can request tokens for the containers running on their machine and sees their decrypted secrets. Only schedule sensitive workloads on nodes you trust (`node_selector`/labels).
+`ogm-hub` tokens are only issued on nodes trusted for the project (see [Security notes](#security-notes)).
 
 ## Key-value store
 
@@ -169,9 +169,9 @@ Any member can create projects, so on a shared hub set a default quota, or each 
 ## Security notes
 
 - **Uploaded files and S3 objects** are served with `Content-Security-Policy: sandbox` and `X-Content-Type-Options: nosniff`. HTML, SVG and other types a browser could render as a page are sent as downloads, so an upload can never run script on the hub's origin. Signed file URLs last at most 7 days.
-- **Use a gateway domain for untrusted workloads.** Without `--gateway-domain`, groups are served under `/gw/{project}/{group}/` on the hub's own origin, where a public group's pages share an origin with the dashboard. With a gateway domain, each group gets its own `{group}-{project}.<domain>` origin.
-- **Links** accept connections only from the container they belong to. Containers on one node otherwise share Docker's default bridge network, so put workloads that must not see each other on different nodes.
-- **Node operators** can see what runs on their machines (see [Instance identity](#instance-identity)).
+- **Workload origins.** With `--gateway-domain` each group gets its own `{group}-{project}.<domain>` origin, and with `--gateway-listen :7778` groups are served from a separate port (a separate origin). Without either, groups are served under `/gw/` on the hub's own origin with `Content-Security-Policy: sandbox`: scripts run, but in an opaque origin that cannot touch the dashboard's storage or the API with its credentials. Apps that need cookies or browser storage need one of the two flags.
+- **Network isolation.** On the Docker runtime every project has its own bridge network (`ogm-net-{project}`), so containers of different projects on the same node cannot reach each other. Links additionally accept connections only from the container they belong to. The process runtime has no isolation; use it only for your own workloads.
+- **Trusted nodes.** Whoever runs a node can inspect the containers on it, including their decrypted secrets. A group that references `{{secret:...}}` is therefore only placed on nodes trusted for its project: nodes owned by a cluster admin, by the project's owner or by one of its members, and nodes an admin marked with `ogm node trust NODE`. The same applies to `ogm-hub` identity tokens. To run such a group on community nodes anyway, set `allow_untrusted_nodes: true` in its spec. Every member belongs to the `default` project, so their nodes are trusted for it; keep sensitive secrets in a project of their own.
 - **Webhook signing keys** are per project: `GET /v1/webhook-secret?project=P`.
 
 ## Templates

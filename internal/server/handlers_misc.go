@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
@@ -51,7 +52,16 @@ func (s *Server) Handler() http.Handler {
 			return
 		}
 		if strings.HasPrefix(r.URL.Path, "/gw/") {
-			s.handlePathGateway(w, r)
+			if b := s.cfg.gatewayBase(); b != "" {
+				target := b + r.URL.Path
+				if r.URL.RawQuery != "" {
+					target += "?" + r.URL.RawQuery
+				}
+				http.Redirect(w, r, target, http.StatusPermanentRedirect)
+				return
+			}
+			// Same origin as the dashboard and API: sandbox the workload's pages.
+			s.handlePathGateway(w, r.WithContext(context.WithValue(r.Context(), sandboxCtxKey{}, true)))
 			return
 		}
 		if r.URL.Path == "/v2" || strings.HasPrefix(r.URL.Path, "/v2/") {
@@ -89,7 +99,7 @@ func (s *Server) nodeAPI(n *store.NodeRow) api.Node {
 		ID: n.ID, Name: n.Name, Status: n.Status, Paused: n.Paused || n.AdminPaused, PauseReason: n.PauseReason,
 		Runtime: n.Info.Runtime, Version: n.Info.Version, OS: n.Info.OS, Arch: n.Info.Arch, CPU: n.Info.CPU,
 		MemoryMB: n.Info.MemoryMB, DiskGB: n.Info.DiskGB, GPUs: n.Info.GPUs, Country: n.Info.Country, Labels: n.Info.Labels,
-		AllowPriorities: n.Info.AllowPriorities, Window: n.Info.Window, LastSeen: store.TP(n.LastSeen),
+		AllowPriorities: n.Info.AllowPriorities, Window: n.Info.Window, LastSeen: store.TP(n.LastSeen), Trusted: s.nodeMarkedTrusted(n.ID),
 		ConnectedSince: store.TP(n.ConnectedSince), CreateTime: store.T(n.Created),
 	}
 	if out.GPUs == nil {
@@ -415,11 +425,21 @@ func (s *Server) registerMiscRoutes(mux *http.ServeMux) {
 			return
 		}
 		var body struct {
-			Name   *string `json:"name"`
-			Paused *bool   `json:"paused"`
+			Name    *string `json:"name"`
+			Paused  *bool   `json:"paused"`
+			Trusted *bool   `json:"trusted"`
 		}
 		if !decode(w, r, &body) {
 			return
+		}
+		if body.Trusted != nil {
+			if u.Role != "admin" || scopeFrom(r.Context()) != nil && scopeFrom(r.Context()).Project != "" {
+				problem(w, http.StatusForbidden, "forbidden", "only a cluster admin can change node trust")
+				return
+			}
+			s.setNodeTrusted(n.ID, *body.Trusted)
+			s.st.AddEvent("", "", "", "", "node.trust", fmt.Sprintf("Node %s marked trusted=%v by %s", n.Name, *body.Trusted, u.Name))
+			s.Poke()
 		}
 		if body.Name != nil && *body.Name != "" {
 			_, _ = s.st.DB.Exec(`UPDATE nodes SET name=? WHERE id=?`, *body.Name, n.ID)

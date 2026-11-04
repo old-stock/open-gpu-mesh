@@ -76,6 +76,9 @@ GET    /install.sh            GET /dl/{os}-{arch}       GET /healthz
 |---|---|
 | Path | `{server}/gw/{project}/{group}/...` (prefix stripped; `X-Forwarded-Prefix` set) |
 | Host | `https://{group}-{project}.{gateway-domain}/...` (needs `--gateway-domain` + wildcard DNS) |
+| Separate port | `{gateway-url}/gw/{project}/{group}/...` (with `--gateway-listen`; the hub's own `/gw/` redirects there) |
+
+Path-mode responses served on the hub's own origin carry `Content-Security-Policy: sandbox allow-scripts ...`, so workload pages cannot reach the dashboard's storage or call the API with its credentials.
 
 **Auth** (when `networking.auth` is on) accepts either:
 - the API key of any member of the project, or

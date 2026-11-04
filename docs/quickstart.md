@@ -18,7 +18,8 @@ ogm server --public-url https://gpu.example.com --data /var/lib/ogm --dist-dir /
 ```
 
 - **TLS:** put a reverse proxy in front. With Caddy: `gpu.example.com { reverse_proxy 127.0.0.1:7777 }`. Websockets and SSE pass through without extra config.
-- **Host-based gateway URLs** (optional): point the wildcard DNS `*.gw.example.com` at the server and pass `--gateway-domain gw.example.com`. Groups then get `https://{group}-{project}.gw.example.com`. Without this, groups use the path form `https://gpu.example.com/gw/{project}/{group}/`.
+- **Host-based gateway URLs** (optional): point the wildcard DNS `*.gw.example.com` at the server and pass `--gateway-domain gw.example.com`. Groups then get `https://{group}-{project}.gw.example.com`. Without this, groups use the path form `https://gpu.example.com/gw/{project}/{group}/`, served sandboxed (no cookies or browser storage) because it shares the dashboard's origin.
+- **Separate gateway port** (no DNS needed): pass `--gateway-listen :7778` and groups get `http://gpu.example.com:7778/gw/{project}/{group}/`, an origin of their own, so apps that need cookies (logins, notebooks, admin UIs) work normally. Behind a TLS proxy, also set `--gateway-url https://apps.example.com`.
 - **Agent binaries:** `--dist-dir` should contain the output of `make dist`. The install script downloads the agent from `/dl/{os}-{arch}`.
 - **First start** prints the admin API key once. Save it.
 
