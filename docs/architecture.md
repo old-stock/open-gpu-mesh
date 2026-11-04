@@ -42,6 +42,7 @@ One Go binary (`ogm`) contains the server, agent, CLI, dev mode, and a demo app.
    - agent → server: `hello` (node info, GPUs, running instances), `heartbeat` (every 5 s, with per-GPU and per-instance stats), `instance.status`, `job.result`, `logs`, `imds.request`
    - server → agent: `welcome`, `instance.start|stop|restart|recreate`, `job.assign|cancel`, `node.config`, and replies to requests
 3. For gateway traffic the **server opens a stream** and writes `{"kind":"proxy","instance_id":"…","port":8080}\n`. The agent dials the container port on 127.0.0.1 and answers with one ack byte. After that both sides splice raw bytes. HTTP keep-alive, websockets, and SSE are just bytes on the stream.
+4. For **links** the direction reverses: the agent listens on the Docker bridge gateway (what `host.docker.internal` resolves to) for each `{{link:GROUP:PORT}}` in the instance's env, and on each connection **opens a stream to the server** with `{"kind":"link","instance_id":"<caller>","group":"db","port":5432}\n`. The server checks that the caller runs on that node and declared the link, picks a ready instance of the target group in the same project, opens a normal proxy stream to its node and splices the two. A container on node A reaches a database on node B with no VPN and no inbound ports on either.
 4. **Reconnects:**
    - When an agent reconnects, its `hello` lists the instances it is still running. The server reconciles that list: it re-sends a start for any instance the agent lost and stops any instance the server no longer knows.
    - Instances on a disconnected node have a 20 s grace period before they are declared interrupted and replaced.
@@ -87,6 +88,6 @@ All state lives in SQLite (`{data}/ogm.db`, WAL mode). Files are stored under `{
 
 ## Security
 
-- **Containers:** no privileges, `no-new-privileges`, risky capabilities dropped (`NET_RAW`, `SYS_ADMIN`, `SYS_MODULE`, `SYS_PTRACE`, `MKNOD`), PID limit, CPU/memory limits, ports published on 127.0.0.1 only (reachable just through the tunnel), no host mounts, optional `runsc` (gVisor).
+- **Containers:** no privileges, `no-new-privileges`, risky capabilities dropped (`NET_RAW`, `SYS_ADMIN`, `SYS_MODULE`, `SYS_PTRACE`, `MKNOD`), PID limit, CPU/memory limits, ports published on 127.0.0.1 only (reachable just through the tunnel), no host mounts (persistent volumes are Docker named volumes), optional `runsc` (gVisor).
 - **Credentials:** API keys and node tokens are stored as SHA-256 hashes. Per-instance IMDS URLs contain a 128-bit secret. JWTs are EdDSA. Webhooks are HMAC-signed. Signed file URLs use HMAC with an expiry.
 - **Trust:** the node owner has root on their machine and can read container memory and environment. The design assumes a group of people who trust each other.

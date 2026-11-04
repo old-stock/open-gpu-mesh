@@ -36,6 +36,8 @@ func cmdServer(e *env, args []string) {
 	data := fs.String("data", envOr("OGM_DATA", "./ogm-data"), "data directory (SQLite db + files)")
 	public := fs.String("public-url", os.Getenv("OGM_PUBLIC_URL"), "externally reachable URL, e.g. https://gpu.example.com")
 	gwDomain := fs.String("gateway-domain", os.Getenv("OGM_GATEWAY_DOMAIN"), "wildcard domain for {group}-{project}.DOMAIN gateway routing (optional)")
+	tlsOn := fs.Bool("tls", os.Getenv("OGM_TLS") == "1", "automatic HTTPS via Let's Encrypt on :443 (+ :80 for challenges/redirect) for the public URL host and custom domains")
+	acmeEmail := fs.String("acme-email", os.Getenv("OGM_ACME_EMAIL"), "contact email for Let's Encrypt (with --tls)")
 	name := fs.String("name", envOr("OGM_CLUSTER_NAME", "open-gpu-mesh"), "cluster name shown in the dashboard")
 	admin := fs.String("admin", "admin", "name of the first admin user")
 	dist := fs.String("dist-dir", os.Getenv("OGM_DIST_DIR"), "directory with ogm-{os}-{arch} binaries served at /dl")
@@ -43,7 +45,7 @@ func cmdServer(e *env, args []string) {
 	level := fs.String("log-level", "info", "debug|info|warn|error")
 	parse(fs, args)
 	srv, err := server.New(server.Config{
-		DataDir: *data, Listen: *listen, PublicURL: *public, GatewayDomain: *gwDomain, ClusterName: *name,
+		DataDir: *data, Listen: *listen, PublicURL: *public, GatewayDomain: *gwDomain, ClusterName: *name, TLS: *tlsOn, ACMEEmail: *acmeEmail,
 		DistDir: *dist, StarterCredits: *starter, Logger: logger(*level),
 	})
 	check(err)
@@ -100,6 +102,7 @@ func cmdAgent(e *env, args []string) {
 	rt := fs.String("runtime", envOr("OGM_RUNTIME", "docker"), "docker|process (process = no isolation, dev only)")
 	fake := fs.String("fake-gpus", "", `simulate GPUs, e.g. "RTX 4090:24564,RTX 3090:24576"`)
 	maxGPUs := fs.Int("max-gpus", 0, "share at most N GPUs (0 = all)")
+	noGPU := fs.Bool("no-gpu", false, "share no GPUs at all (CPU, memory and disk only); the agent never queries the GPUs")
 	maxCPU := fs.Int("max-cpu", 0, "share at most N vCPUs")
 	maxMem := fs.Int("max-memory-mb", 0, "share at most N MB RAM")
 	maxDisk := fs.Int("max-disk-gb", 0, "share at most N GB disk")
@@ -140,6 +143,9 @@ func cmdAgent(e *env, args []string) {
 	var gpus agent.GPUSource = agent.NvidiaSMI{}
 	if *fake != "" {
 		gpus = agent.ParseFakeGPUs(*fake)
+	}
+	if *noGPU {
+		gpus = agent.ParseFakeGPUs("")
 	}
 	lm := map[string]string{}
 	for _, l := range labels {

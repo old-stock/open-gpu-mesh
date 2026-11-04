@@ -1,0 +1,25 @@
+# PostgreSQL with a persistent volume. CPU-only: runs on any contributor, no GPU needed.
+#   ogm secret set pg-password            # prompts for the value; stored encrypted on the hub
+#   ogm deploy -f examples/postgres.yaml
+# Other groups in the project connect with env like
+#   DATABASE_URL: postgres://app:{{secret:pg-password}}@{{link:postgres:5432}}/app
+# The volume pins replica 0 to the node that first ran it: if that node goes offline the
+# database waits for it (it does not start empty elsewhere). Back up with pg_dump to the
+# file store; `ogm volumes rm postgres` deletes the data once the group is removed.
+name: postgres
+replicas: 1
+priority: high
+container:
+  image: postgres:17
+  env:
+    POSTGRES_USER: app
+    POSTGRES_DB: app
+    POSTGRES_PASSWORD: "{{secret:pg-password}}"
+    PGDATA: /var/lib/postgresql/data/pgdata
+  ports: [5432]
+  volumes:
+    - { name: data, mount: /var/lib/postgresql/data }
+  resources: { cpu: 1, memory_mb: 1024 }
+readiness_probe:
+  tcp: { port: 5432 }
+  period_seconds: 5

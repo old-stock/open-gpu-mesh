@@ -133,6 +133,7 @@ Run a cluster:
   ogm server [--listen :7777] [--data ./ogm-data] [--public-url URL]   start the control plane
   ogm agent --server URL --token TOKEN [flags]                         contribute this machine
   ogm agent pause|resume|status                                        control the local agent
+  ogm assess [--profile gaming,cad] [--token T]                         audit this machine: hardware, speed test, NAT, suggested limits
   ogm dev [--nodes 3]                                                  everything on your laptop (simulated GPUs)
 
 Account:
@@ -155,6 +156,22 @@ Workloads:
   ogm url GROUP [--rotate]                    print the gateway URL and its shareable token
   ogm curl GROUP [PATH] [curl args...]        call the gateway with your key
 
+Secrets & volumes:
+  ogm secret set NAME [VALUE | --from-file F] use in env as {{secret:NAME}}; stored encrypted
+  ogm secret ls | rm NAME
+  ogm volumes [ls] | rm GROUP [--replica N]   persistent volumes (container.volumes), pinned to a node
+
+Data & automation:
+  ogm kv tables | ls TABLE | get T K | put T K V [--ttl 10m] [--if-version N] | incr T K | rm T K | drop T
+  ogm schedule [ls] | create NAME --cron "*/5 * * * *" (--queue Q | --http GROUP | --scale GROUP --replicas N) | run | rm
+  ogm snapshot create GROUP [--replica N] | ls | restore ID [--node NODE] | rm ID   volume backups / migration
+  ogm template [ls] | show NAME | deploy NAME [--name G]   ready-made services (postgres, redis, s3, ...)
+  ogm metrics GROUP [--minutes 60]            requests, errors, latency, replicas, CPU/memory per minute
+  ogm quota [show] | set --cpu N --memory-mb N --gpus N --instances N --storage-mb N   project limits (set: admin)
+
+Access:
+  ogm keys [ls] | create NAME [--project P] [--role developer|viewer|admin] [--expires 720h] | rm ID
+
 Queues & jobs:
   ogm queue create NAME [--max-attempts N] [--timeout S] | ls | rm NAME [--force]
   ogm job submit QUEUE [--input JSON | --file F | --batch F.jsonl] [--wait]
@@ -163,6 +180,7 @@ Queues & jobs:
 Nodes & GPUs:
   ogm nodes                                   list contributor machines
   ogm node add NAME                           create a join token + install command
+  ogm node assessment NODE                    show the onboarding audit (hardware, speed, tier, advice)
   ogm node pause|resume|rm NODE_ID
   ogm gpus                                    GPU classes, availability and credit prices
 
@@ -173,6 +191,11 @@ Images (built-in registry, no account needed):
 
 Files:
   ogm files ls [PREFIX] | put LOCAL [REMOTE] | get REMOTE [LOCAL] | rm REMOTE | sign REMOTE [--put]
+  ogm s3 credentials create [--save] | ls | rm KEY   S3-compatible storage (boto3/aws-cli/rclone; docs/s3.md)
+  ogm s3 mb|rb BUCKET | ls [BUCKET[/PREFIX]] | cp SRC DST | rm s3://B/K | presign s3://B/K
+
+AI assistants:
+  ogm mcp                                     run an MCP server on stdio (for Claude Desktop/Code, Cursor...)
 
 Global flags: --project NAME, -o json
 `
@@ -271,6 +294,26 @@ func Main(args []string) {
 		cmdNode(e, cargs)
 	case "gpus", "gpu-classes":
 		cmdGPUs(e)
+	case "secret", "secrets":
+		cmdSecret(e, cargs)
+	case "volume", "volumes":
+		cmdVolumes(e, cargs)
+	case "key", "keys":
+		cmdKeys(e, cargs)
+	case "kv":
+		cmdKV(e, cargs)
+	case "schedule", "schedules", "cron":
+		cmdSchedule(e, cargs)
+	case "snapshot", "snapshots":
+		cmdSnapshot(e, cargs)
+	case "metrics":
+		cmdMetrics(e, cargs)
+	case "quota", "quotas":
+		cmdQuota(e, cargs)
+	case "template", "templates":
+		cmdTemplate(e, cargs)
+	case "assess", "audit":
+		cmdAssess(e, cargs)
 	case "push":
 		cmdPush(e, cargs)
 	case "images":
@@ -279,6 +322,10 @@ func Main(args []string) {
 		cmdRegistryProxy(e, cargs)
 	case "files", "file":
 		cmdFiles(e, cargs)
+	case "s3":
+		cmdS3(e, cargs)
+	case "mcp":
+		cmdMCP(e, cargs)
 	default:
 		fatalf("unknown command %q (see `ogm help`)", cmd)
 	}

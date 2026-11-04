@@ -1,0 +1,10 @@
+# Tiny demo image (the built-in demo app, no OS): build per architecture from a
+# cross-compiled binary, e.g.
+#   GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o ogm-arm64 ./cmd/ogm
+#   docker build --platform linux/arm64 --build-arg BIN=ogm-arm64 -f Dockerfile.demo -t ogm-demo:arm64 .
+FROM scratch
+ARG BIN=ogm
+COPY ${BIN} /ogm
+ENV PATH=/usr/bin:/bin
+EXPOSE 8080
+ENTRYPOINT ["/ogm", "demo-app"]

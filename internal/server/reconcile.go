@@ -24,11 +24,46 @@ const (
 )
 
 // instanceSpec renders the agent-facing spec for an instance.
-func (s *Server) instanceSpec(g *store.GroupRow, in *store.InstanceRow) *proto.InstanceSpec {
+// It fails only when a referenced secret is missing or unreadable.
+func (s *Server) instanceSpec(g *store.GroupRow, in *store.InstanceRow) (*proto.InstanceSpec, error) {
 	sp := g.Spec
 	env := map[string]string{}
+	links := map[proto.Link]bool{}
 	for k, v := range sp.Container.Env {
+		for _, ref := range api.ParseRefs(v) {
+			if ref.Kind != "secret" {
+				links[proto.Link{Group: ref.Name, Port: ref.Port}] = true
+			}
+		}
+		v, err := s.expandSecrets(g.Project, v)
+		if err != nil {
+			return nil, err
+		}
 		env[k] = v
+	}
+	auth := sp.Container.RegistryAuth
+	if auth != nil && len(api.ParseRefs(auth.Password)) > 0 {
+		pw, err := s.expandSecrets(g.Project, auth.Password)
+		if err != nil {
+			return nil, err
+		}
+		cp := *auth
+		cp.Password = pw
+		auth = &cp
+	}
+	var linkList []proto.Link
+	for l := range links {
+		linkList = append(linkList, l)
+	}
+	sort.Slice(linkList, func(a, b int) bool {
+		if linkList[a].Group != linkList[b].Group {
+			return linkList[a].Group < linkList[b].Group
+		}
+		return linkList[a].Port < linkList[b].Port
+	})
+	var vols []proto.VolumeMount
+	for _, v := range sp.Container.Volumes {
+		vols = append(vols, proto.VolumeMount{Name: v.Name, Source: volumeName(g.Project, g.Name, v.Name, in.ReplicaIndex), Target: v.Mount})
 	}
 	env["OGM_INSTANCE_ID"] = in.ID
 	env["OGM_CONTAINER_GROUP"] = g.Name
@@ -39,6 +74,9 @@ func (s *Server) instanceSpec(g *store.GroupRow, in *store.InstanceRow) *proto.I
 	env["OGM_REPLICA_INDEX"] = strconv.Itoa(in.ReplicaIndex)
 	env["OGM_REPLICAS"] = strconv.Itoa(g.DesiredReplicas)
 	ports := map[int]bool{}
+	for _, p := range sp.Container.Ports {
+		ports[p] = true
+	}
 	if sp.Networking != nil {
 		ports[sp.Networking.Port] = true
 	}
@@ -65,11 +103,20 @@ func (s *Server) instanceSpec(g *store.GroupRow, in *store.InstanceRow) *proto.I
 	sort.Ints(pl)
 	return &proto.InstanceSpec{
 		ID: in.ID, Project: g.Project, Group: g.Name, GroupID: g.ID, Version: in.Version,
-		Image: sp.Container.Image, Command: sp.Container.Command, Env: env, RegistryAuth: sp.Container.RegistryAuth, PullPolicy: sp.Container.ImagePullPolicy,
+		Image: sp.Container.Image, Command: sp.Container.Command, Env: env, RegistryAuth: auth, PullPolicy: sp.Container.ImagePullPolicy,
 		Resources: sp.Container.Resources, GPUIndexes: in.GPUIndexes, Ports: pl,
 		StartupProbe: sp.StartupProbe, ReadinessProbe: sp.ReadinessProbe, LivenessProbe: sp.LivenessProbe,
 		RestartPolicy: sp.RestartPolicy, IMDSSecret: in.IMDSSecret, DeletionCost: in.DeletionCost,
-	}
+		Links: linkList, Volumes: vols,
+	}, nil
+}
+
+// volumeName is the runtime name of a group replica's volume. It is derived from the
+// project/group names (not IDs), so data survives deleting and re-deploying a group.
+// Fields are joined with "_", which names cannot contain, so two different
+// (project, group, volume) tuples can never map to the same runtime volume.
+func volumeName(project, group, vol string, replica int) string {
+	return fmt.Sprintf("ogm-vol-%s_%s_%s_%d", project, group, vol, replica)
 }
 
 var stateEvent = map[string]string{
@@ -384,6 +431,16 @@ func (s *Server) reconcileGroup(g *store.GroupRow) {
 			if budget <= 0 {
 				break
 			}
+			next := *in
+			next.Version = g.Version
+			spec, err := s.instanceSpec(g, &next)
+			if err != nil { // keep the old version running until the secret exists
+				if msg := "update waiting: " + err.Error(); in.Message != msg {
+					in.Message = msg
+					_ = s.st.SaveInstance(in)
+				}
+				continue
+			}
 			budget--
 			in.Version = g.Version
 			in.State = api.InstDownloading
@@ -391,7 +448,7 @@ func (s *Server) reconcileGroup(g *store.GroupRow) {
 			in.RunningAt = sql.NullInt64{}
 			_ = s.st.SaveInstance(in)
 			s.st.AddEvent(in.Project, in.GroupID, in.ID, in.NodeID, "instance.updating", fmt.Sprintf("Instance Updating (Version %d)", g.Version))
-			if !s.hub.send(in.NodeID, proto.TypeInstanceRecreate, proto.InstanceRef{ID: in.ID, Spec: s.instanceSpec(g, in)}) {
+			if !s.hub.send(in.NodeID, proto.TypeInstanceRecreate, proto.InstanceRef{ID: in.ID, Spec: spec}) {
 				s.terminate(in, "node offline during update", nil)
 			}
 		}
@@ -708,7 +765,15 @@ func (s *Server) place(nodes []*store.NodeRow, online map[string]*nodeSession) {
 		bestScore := -1e18
 		reasons := map[string]int{}
 		var preemptable []*nodeCap
+		pin := ""
+		if len(g.Spec.Container.Volumes) > 0 {
+			pin = s.volumePin(g.Project, g.Name, in.ReplicaIndex)
+		}
 		for _, c := range caps {
+			if pin != "" && c.node.ID != pin {
+				reasons["volume on another node"]++
+				continue
+			}
 			if why := s.eligible(c.node, g, banned); why != "" {
 				reasons[why]++
 				continue
@@ -733,7 +798,17 @@ func (s *Server) place(nodes []*store.NodeRow, online map[string]*nodeSession) {
 				continue
 			}
 			msg := "waiting for capacity"
-			if len(reasons) > 0 {
+			pinnedOnline := false
+			for _, c := range caps {
+				pinnedOnline = pinnedOnline || c.node.ID == pin
+			}
+			if pin != "" && !pinnedOnline {
+				name := pin
+				if n, err := s.st.NodeByID(pin); err == nil {
+					name = n.Name
+				}
+				msg = "waiting for node " + name + " (it holds this replica's volumes)"
+			} else if len(reasons) > 0 {
 				var parts []string
 				for k, v := range reasons {
 					parts = append(parts, fmt.Sprintf("%d %s", v, k))
@@ -750,13 +825,23 @@ func (s *Server) place(nodes []*store.NodeRow, online map[string]*nodeSession) {
 			continue
 		}
 		// Assign.
+		next := *in
+		next.NodeID, next.GPUIndexes = best.node.ID, bestGPUs
+		spec, err := s.instanceSpec(g, &next)
+		if err != nil {
+			if msg := "waiting: " + err.Error(); in.Message != msg {
+				in.Message = msg
+				_ = s.st.SaveInstance(in)
+			}
+			continue
+		}
 		in.NodeID = best.node.ID
 		in.GPUIndexes = bestGPUs
 		in.State = api.InstDownloading
 		in.Message = ""
 		in.AssignedAt = sql.NullInt64{Int64: store.Now(), Valid: true}
 		_ = s.st.SaveInstance(in)
-		if !s.hub.send(best.node.ID, proto.TypeInstanceStart, proto.InstanceRef{ID: in.ID, Spec: s.instanceSpec(g, in)}) {
+		if !s.hub.send(best.node.ID, proto.TypeInstanceStart, proto.InstanceRef{ID: in.ID, Spec: spec}) {
 			in.NodeID, in.GPUIndexes, in.State = "", nil, api.InstAllocating
 			in.AssignedAt = sql.NullInt64{}
 			_ = s.st.SaveInstance(in)
@@ -773,6 +858,13 @@ func (s *Server) place(nodes []*store.NodeRow, online map[string]*nodeSession) {
 			msg += " (" + gpuName + ")"
 		}
 		s.st.AddEvent(in.Project, in.GroupID, in.ID, best.node.ID, "instance.allocated", msg)
+		if len(spec.Volumes) > 0 {
+			var names []string
+			for _, v := range spec.Volumes {
+				names = append(names, v.Source)
+			}
+			s.pinVolume(g.Project, g.Name, in.ReplicaIndex, best.node.ID, names)
+		}
 		best.claimGPUs(bestGPUs, r, false)
 		best.freeCPU -= r.CPU
 		best.freeMemMB -= r.MemoryMB

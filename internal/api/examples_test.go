@@ -30,7 +30,7 @@ func TestExamplesValidate(t *testing.T) {
 			}
 			var kind struct{ Kind string }
 			_ = node.Decode(&kind)
-			if kind.Kind == "queue" {
+			if kind.Kind == "queue" || kind.Kind == "schedule" {
 				continue
 			}
 			var spec ContainerGroupSpec

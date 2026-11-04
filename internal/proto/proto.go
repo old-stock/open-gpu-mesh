@@ -30,6 +30,7 @@ const (
 	TypeInstanceStart    = "instance.start"
 	TypeInstanceStop     = "instance.stop"
 	TypeInstanceRestart  = "instance.restart"
+	TypeVolumeDelete     = "volume.delete" // server -> agent: remove named volumes
 	TypeInstanceRecreate = "instance.recreate"
 	TypeJobAssign        = "job.assign"
 	TypeJobCancel        = "job.cancel"
@@ -119,6 +120,22 @@ type InstanceSpec struct {
 	RestartPolicy  string            `json:"restart_policy"`
 	IMDSSecret     string            `json:"imds_secret"`
 	DeletionCost   int               `json:"deletion_cost"`
+	Links          []Link            `json:"links,omitempty"`   // other groups this instance reaches via the hub
+	Volumes        []VolumeMount     `json:"volumes,omitempty"` // persistent named volumes
+}
+
+// Link is a target the agent exposes to the container on a local port; connections are
+// relayed through the hub to a ready instance of the target group (same project).
+type Link struct {
+	Group string `json:"group"`
+	Port  int    `json:"port"`
+}
+
+// VolumeMount is a persistent named volume.
+type VolumeMount struct {
+	Name   string `json:"name"`   // volume name from the group spec
+	Source string `json:"source"` // runtime volume name, stable per group replica
+	Target string `json:"target"` // mount path in the container
 }
 
 // InstanceStop asks the agent to stop (and remove) an instance.
@@ -194,6 +211,7 @@ type IMDSRequest struct {
 	Op           string `json:"op"`
 	DeletionCost int    `json:"deletion_cost,omitempty"`
 	Reason       string `json:"reason,omitempty"`
+	Audience     string `json:"audience,omitempty"`
 }
 
 // IMDSReply is the server's reply.
@@ -209,9 +227,10 @@ type NodeConfig struct {
 
 // StreamHeader opens a data stream.
 type StreamHeader struct {
-	Kind       string `json:"kind"` // "proxy"
-	InstanceID string `json:"instance_id"`
+	Kind       string `json:"kind"`        // "proxy" (hub -> agent) | "link" (agent -> hub)
+	InstanceID string `json:"instance_id"` // proxy: target instance; link: the calling instance
 	Port       int    `json:"port"`
+	Group      string `json:"group,omitempty"` // link: target group in the caller's project
 }
 
 // Stream ack bytes.
@@ -279,4 +298,34 @@ func readLine(r *bufio.Reader, max int) ([]byte, error) {
 			return buf, nil
 		}
 	}
+}
+
+// VolumeDelete asks an agent to remove persistent volumes.
+type VolumeDelete struct {
+	Names []string `json:"names"`
+}
+
+// Volume snapshot/restore (server -> agent), answered with TypeVolumeOpDone.
+const (
+	TypeVolumeSnapshot = "volume.snapshot"
+	TypeVolumeRestore  = "volume.restore"
+	TypeVolumeOpDone   = "volume.op_done"
+)
+
+// VolumeOp asks the agent to archive volumes to (or restore them from) a hub URL. The
+// archive is a gzipped tar with one top-level directory per volume name.
+type VolumeOp struct {
+	ID      string            `json:"id"`
+	Volumes []VolumeMount     `json:"volumes"`
+	Image   string            `json:"image"` // image used for the helper container (never started)
+	Auth    *api.RegistryAuth `json:"auth,omitempty"`
+	URL     string            `json:"url"` // hub-relative presigned path: PUT for snapshot, GET for restore
+}
+
+// VolumeOpDone reports a finished snapshot or restore.
+type VolumeOpDone struct {
+	ID    string `json:"id"`
+	Op    string `json:"op"`
+	Bytes int64  `json:"bytes"`
+	Error string `json:"error,omitempty"`
 }

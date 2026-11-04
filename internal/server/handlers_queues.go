@@ -261,7 +261,7 @@ func (s *Server) registerQueueRoutes(mux *http.ServeMux) {
 			return
 		}
 		// Long-poll: ?wait=30 blocks until the job reaches a terminal state (max 60s).
-		if wait := qint(r, "wait", 0); wait > 0 {
+		if wait := qseconds(r, "wait", 0); wait > 0 {
 			if wait > 60 {
 				wait = 60
 			}

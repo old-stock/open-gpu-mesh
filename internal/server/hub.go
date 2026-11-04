@@ -126,6 +126,7 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	s.hub.mu.Unlock()
 
 	s.onHello(node, ns, hello)
+	go s.acceptAgentStreams(ns)
 	_ = codec.Send(proto.TypeWelcome, "", proto.Welcome{NodeID: node.ID, NodeName: node.Name, ServerTime: time.Now()})
 	s.log.Info("node connected", "node", node.Name, "id", node.ID, "gpus", len(hello.GPUs), "runtime", hello.Runtime)
 	s.Poke()
@@ -195,11 +196,16 @@ func (s *Server) onHello(node *store.NodeRow, ns *nodeSession, h proto.Hello) {
 		}
 		// The agent lost this instance (restart, crash). Re-send the start so it comes back
 		// on the same node if the node still has capacity, otherwise reschedule.
-		if g, err := s.st.GroupByID(in.GroupID); err == nil && (g.Status == api.GroupRunning || g.Status == api.GroupDeploying) {
+		g, err := s.st.GroupByID(in.GroupID)
+		var spec *proto.InstanceSpec
+		if err == nil {
+			spec, err = s.instanceSpec(g, in)
+		}
+		if err == nil && (g.Status == api.GroupRunning || g.Status == api.GroupDeploying) {
 			in.State = api.InstDownloading
 			in.Ready, in.Started = false, false
 			_ = s.st.SaveInstance(in)
-			_ = ns.codec.Send(proto.TypeInstanceStart, "", proto.InstanceRef{ID: in.ID, Spec: s.instanceSpec(g, in)})
+			_ = ns.codec.Send(proto.TypeInstanceStart, "", proto.InstanceRef{ID: in.ID, Spec: spec})
 		} else {
 			s.terminate(in, "node restarted", nil)
 		}
@@ -241,6 +247,11 @@ func (s *Server) handleAgentMessage(ns *nodeSession, env proto.Envelope) {
 		var hb proto.Heartbeat
 		if json.Unmarshal(env.Data, &hb) == nil {
 			s.onHeartbeat(ns, hb)
+		}
+	case proto.TypeVolumeOpDone:
+		var d proto.VolumeOpDone
+		if json.Unmarshal(env.Data, &d) == nil {
+			s.onVolumeOpDone(ns, d)
 		}
 	case proto.TypeInstanceStatus:
 		var ir proto.InstanceReport

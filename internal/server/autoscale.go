@@ -74,6 +74,9 @@ func (s *Server) autoscale() {
 		if g.Status != api.GroupRunning && g.Status != api.GroupDeploying {
 			continue
 		}
+		if g.Spec.HTTPAutoscaler != nil {
+			continue // httpAutoscale
+		}
 		desired := g.DesiredReplicas
 		reason := ""
 		changedState := false

@@ -196,9 +196,19 @@ func (s *Server) handleIMDS(nodeID string, req proto.IMDSRequest) (*proto.IMDSRe
 	}
 	switch req.Op {
 	case proto.IMDSToken:
+		// The default audience proves identity to third parties; only a token minted
+		// for audience "ogm-hub" is accepted by the hub API, so handing an identity
+		// token to another service never hands it hub access.
+		aud := req.Audience
+		if aud == "" {
+			aud = jwtAudWorkload
+		}
+		if len(aud) > 256 || strings.ContainsAny(aud, " \t\r\n\"") {
+			return nil, errors.New("invalid audience")
+		}
 		now := time.Now()
 		jwt, err := webhook.SignJWT(s.jwtPriv, s.jwtKid, map[string]any{
-			"iss": s.cfg.PublicURL, "sub": in.ID, "aud": "ogm-workload",
+			"iss": s.cfg.PublicURL, "sub": in.ID, "aud": aud,
 			"project": in.Project, "container_group": g.Name, "container_group_id": g.ID, "node_id": in.NodeID,
 			"iat": now.Unix(), "exp": now.Add(time.Hour).Unix(),
 		})

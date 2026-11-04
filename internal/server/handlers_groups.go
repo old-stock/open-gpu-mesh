@@ -4,8 +4,10 @@ import (
 	"database/sql"
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/old-stock/open-gpu-mesh/internal/api"
 	"github.com/old-stock/open-gpu-mesh/internal/proto"
@@ -117,6 +119,24 @@ func runtimeFingerprint(sp api.ContainerGroupSpec) string {
 	})
 }
 
+// decodeSpec decodes a container group spec, defaulting replicas to 1 when the
+// body leaves the field out.
+func decodeSpec(w http.ResponseWriter, r *http.Request, sp *api.ContainerGroupSpec) bool {
+	var raw json.RawMessage
+	if !decode(w, r, &raw) {
+		return false
+	}
+	if err := json.Unmarshal(raw, sp); err != nil {
+		problem(w, http.StatusBadRequest, "invalid json", err.Error())
+		return false
+	}
+	var keys map[string]json.RawMessage
+	_ = json.Unmarshal(raw, &keys)
+	_, present := keys["replicas"]
+	sp.DefaultReplicas(present)
+	return true
+}
+
 func initialReplicas(sp api.ContainerGroupSpec) int {
 	if sp.QueueAutoscaler != nil {
 		r := sp.Replicas
@@ -132,6 +152,50 @@ func initialReplicas(sp api.ContainerGroupSpec) int {
 }
 
 func (s *Server) checkSpecRefs(w http.ResponseWriter, sp *api.ContainerGroupSpec) bool {
+	// The gateway routes {group}-{project}.<domain>; names may contain "-", so refuse a
+	// group whose label is already served by a different (group, project) pair.
+	label := sp.Name + "-" + sp.Project
+	all, _ := s.st.Groups("")
+	for _, g := range all {
+		if g.Project != sp.Project && g.Name+"-"+g.Project == label {
+			validationProblem(w, map[string][]string{"name": {"the gateway hostname " + label + " is already used by group " + g.Name + " in project " + g.Project + "; choose another name"}})
+			return false
+		}
+	}
+	if sp.Networking != nil && len(sp.Networking.CustomDomains) > 0 {
+		for _, d := range sp.Networking.CustomDomains {
+			if s.reservedHost(d) {
+				validationProblem(w, map[string][]string{"networking.custom_domains": {d + " is reserved for the hub itself"}})
+				return false
+			}
+		}
+		groups, _ := s.st.Groups("")
+		for _, g := range groups {
+			if g.Project == sp.Project && g.Name == sp.Name || g.Spec.Networking == nil {
+				continue
+			}
+			for _, d := range g.Spec.Networking.CustomDomains {
+				for _, want := range sp.Networking.CustomDomains {
+					if d == want {
+						validationProblem(w, map[string][]string{"networking.custom_domains": {want + " is already used by another container group"}})
+						return false
+					}
+				}
+			}
+		}
+		if s.cfg.GatewayDomain != "" {
+			for _, d := range sp.Networking.CustomDomains {
+				if strings.HasSuffix(d, "."+s.cfg.GatewayDomain) {
+					validationProblem(w, map[string][]string{"networking.custom_domains": {d + " is inside the gateway domain; it is already routed as {group}-{project}." + s.cfg.GatewayDomain}})
+					return false
+				}
+			}
+		}
+	}
+	if v := s.checkGroupQuota(*sp); v != nil {
+		quotaProblem(w, v)
+		return false
+	}
 	if sp.QueueConnection != nil {
 		if _, err := s.st.Queue(sp.Project, sp.QueueConnection.QueueName); err != nil {
 			validationProblem(w, map[string][]string{"queue_connection.queue_name": {"queue " + sp.QueueConnection.QueueName + " does not exist in project " + sp.Project}})
@@ -268,7 +332,7 @@ func (s *Server) registerGroupRoutes(mux *http.ServeMux) {
 
 	mux.HandleFunc("POST "+base, s.projected(func(w http.ResponseWriter, r *http.Request, u *store.UserRow, p string) {
 		var sp api.ContainerGroupSpec
-		if !decode(w, r, &sp) {
+		if !decodeSpec(w, r, &sp) {
 			return
 		}
 		s.createGroup(w, u, p, sp)
@@ -286,7 +350,7 @@ func (s *Server) registerGroupRoutes(mux *http.ServeMux) {
 	// PUT = declarative upsert (used by `ogm deploy`).
 	mux.HandleFunc("PUT "+base+"/{group}", s.projected(func(w http.ResponseWriter, r *http.Request, u *store.UserRow, p string) {
 		var sp api.ContainerGroupSpec
-		if !decode(w, r, &sp) {
+		if !decodeSpec(w, r, &sp) {
 			return
 		}
 		sp.Name = r.PathValue("group")
@@ -478,10 +542,15 @@ func (s *Server) registerGroupRoutes(mux *http.ServeMux) {
 			s.requestStop(in, "reallocated", "", 5)
 			s.Poke()
 		case "recreate":
+			spec, err := s.instanceSpec(g, in)
+			if err != nil {
+				problem(w, http.StatusConflict, "can't recreate", err.Error())
+				return
+			}
 			in.State, in.Ready, in.Started = api.InstDownloading, false, false
 			_ = s.st.SaveInstance(in)
 			s.st.AddEvent(p, g.ID, in.ID, in.NodeID, "instance.recreated", "Instance Recreated")
-			s.hub.send(in.NodeID, proto.TypeInstanceRecreate, proto.InstanceRef{ID: in.ID, Spec: s.instanceSpec(g, in)})
+			s.hub.send(in.NodeID, proto.TypeInstanceRecreate, proto.InstanceRef{ID: in.ID, Spec: spec})
 		case "restart":
 			s.st.AddEvent(p, g.ID, in.ID, in.NodeID, "instance.restarted", "Instance Restarted")
 			s.hub.send(in.NodeID, proto.TypeInstanceRestart, proto.InstanceRef{ID: in.ID})
@@ -529,4 +598,17 @@ func (s *Server) events(where string, limit int, args ...any) []api.Event {
 		}
 	}
 	return out
+}
+
+// reservedHost reports hostnames that must never be routed to a workload: the hub's
+// own public host, its gateway domain, and the internal host MCP sub-requests use.
+func (s *Server) reservedHost(host string) bool {
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	if host == "ogm.internal" || host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	if u, err := url.Parse(s.cfg.PublicURL); err == nil && strings.EqualFold(u.Hostname(), host) {
+		return true
+	}
+	return s.cfg.GatewayDomain != "" && strings.EqualFold(s.cfg.GatewayDomain, host)
 }

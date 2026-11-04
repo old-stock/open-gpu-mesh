@@ -9,12 +9,15 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/old-stock/open-gpu-mesh/internal/api"
+	"github.com/old-stock/open-gpu-mesh/internal/proto"
 )
 
 // StartSpec describes a container to create.
@@ -26,6 +29,7 @@ type StartSpec struct {
 	Resources  api.Resources
 	GPUIndexes []int
 	Ports      []int
+	Volumes    []proto.VolumeMount
 	Labels     map[string]string
 }
 
@@ -69,8 +73,44 @@ type Container interface {
 // except the special image "ogm/demo" which runs this binary's built-in demo app.
 // Each declared container port gets a free host port; the first is exported as $PORT
 // and every mapping as $OGM_PORT_<containerPort>. Not isolated: dev use only.
+//
+// Volumes are directories under VolumeDir (default: $TMPDIR/ogm-volumes), exported as
+// $OGM_VOLUME_<NAME> since a plain process cannot mount them at the requested path.
 type ProcessRuntime struct {
-	SelfExe string
+	SelfExe   string
+	VolumeDir string
+}
+
+func (p *ProcessRuntime) volumeDir() string {
+	if p.VolumeDir != "" {
+		return p.VolumeDir
+	}
+	return filepath.Join(os.TempDir(), "ogm-volumes")
+}
+
+// RemoveVolumes implements VolumeRemover.
+func (p *ProcessRuntime) RemoveVolumes(_ context.Context, names []string) error {
+	for _, n := range names {
+		if n == "" || strings.ContainsAny(n, `/\`) || n == "." || n == ".." {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(p.volumeDir(), n)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func envName(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z':
+			return r - 32
+		case r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			return r
+		}
+		return '_'
+	}, s)
 }
 
 // Name implements Runtime.
@@ -136,6 +176,13 @@ func (p *ProcessRuntime) Create(ctx context.Context, spec StartSpec) (Container,
 		if i == 0 {
 			env = append(env, fmt.Sprintf("PORT=%d", hp))
 		}
+	}
+	for _, v := range spec.Volumes {
+		dir := filepath.Join(p.volumeDir(), v.Source)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return nil, err
+		}
+		env = append(env, "OGM_VOLUME_"+envName(v.Name)+"="+dir)
 	}
 	pc.env = env
 	if err := pc.start(); err != nil {

@@ -52,6 +52,7 @@ type ContainerGroupSpec struct {
 	LivenessProbe           *Probe            `json:"liveness_probe,omitempty" yaml:"liveness_probe,omitempty"`
 	QueueConnection         *QueueConnection  `json:"queue_connection,omitempty" yaml:"queue_connection,omitempty"`
 	QueueAutoscaler         *QueueAutoscaler  `json:"queue_autoscaler,omitempty" yaml:"queue_autoscaler,omitempty"`
+	HTTPAutoscaler          *HTTPAutoscaler   `json:"http_autoscaler,omitempty" yaml:"http_autoscaler,omitempty"`
 	ScalingActions          []ScalingAction   `json:"scaling_actions,omitempty" yaml:"scaling_actions,omitempty"`
 	ScheduledScalingEnabled bool              `json:"scheduled_scaling_enabled,omitempty" yaml:"scheduled_scaling_enabled,omitempty"`
 	Readme                  string            `json:"readme,omitempty" yaml:"readme,omitempty"`
@@ -65,6 +66,28 @@ type ContainerSpec struct {
 	RegistryAuth    *RegistryAuth     `json:"registry_auth,omitempty" yaml:"registry_auth,omitempty"`
 	ImagePullPolicy string            `json:"image_pull_policy,omitempty" yaml:"image_pull_policy,omitempty"` // always|if_not_present|never
 	Resources       Resources         `json:"resources" yaml:"resources"`
+	// Ports are extra container ports reachable by other groups in the project through links
+	// ({{link:GROUP:PORT}} in their env). Never exposed publicly.
+	Ports []int `json:"ports,omitempty" yaml:"ports,omitempty"`
+	// Volumes are persistent per-replica volumes. A replica with volumes is pinned to the node
+	// that holds its data and waits for that node if it is offline.
+	Volumes []Volume `json:"volumes,omitempty" yaml:"volumes,omitempty"`
+}
+
+// Volume is a persistent named volume mounted into every replica (one volume per replica).
+type Volume struct {
+	Name  string `json:"name" yaml:"name"`
+	Mount string `json:"mount" yaml:"mount"`
+}
+
+// HTTPAutoscaler scales a gateway-enabled group on concurrent requests ("serverless"):
+// requests to a group at zero replicas start one and wait for it.
+type HTTPAutoscaler struct {
+	MinReplicas           int `json:"min_replicas" yaml:"min_replicas"`
+	MaxReplicas           int `json:"max_replicas" yaml:"max_replicas"`
+	TargetConcurrency     int `json:"target_concurrency,omitempty" yaml:"target_concurrency,omitempty"`             // in-flight requests per replica (default 10)
+	StableWindowSeconds   int `json:"stable_window_seconds,omitempty" yaml:"stable_window_seconds,omitempty"`       // averaging window (default 60)
+	ScaleDownDelaySeconds int `json:"scale_down_delay_seconds,omitempty" yaml:"scale_down_delay_seconds,omitempty"` // low demand this long before scaling down (default 300)
 }
 
 // RegistryAuth holds private registry credentials.
@@ -111,12 +134,14 @@ const (
 
 // Networking configures the container gateway. All fields are mutable.
 type Networking struct {
-	Port                    int    `json:"port" yaml:"port"`
-	Auth                    bool   `json:"auth" yaml:"auth"`
-	LoadBalancer            string `json:"load_balancer,omitempty" yaml:"load_balancer,omitempty"`
-	SingleConnectionLimit   bool   `json:"single_connection_limit,omitempty" yaml:"single_connection_limit,omitempty"`
-	ClientRequestTimeoutMS  int    `json:"client_request_timeout_ms,omitempty" yaml:"client_request_timeout_ms,omitempty"`
-	ServerResponseTimeoutMS int    `json:"server_response_timeout_ms,omitempty" yaml:"server_response_timeout_ms,omitempty"`
+	Port                    int      `json:"port" yaml:"port"`
+	Auth                    bool     `json:"auth" yaml:"auth"`
+	LoadBalancer            string   `json:"load_balancer,omitempty" yaml:"load_balancer,omitempty"`
+	SingleConnectionLimit   bool     `json:"single_connection_limit,omitempty" yaml:"single_connection_limit,omitempty"`
+	MaxConcurrency          int      `json:"max_concurrency,omitempty" yaml:"max_concurrency,omitempty"` // hard cap of in-flight requests per instance; extra requests wait (0 = unlimited)
+	CustomDomains           []string `json:"custom_domains,omitempty" yaml:"custom_domains,omitempty"`   // hostnames (CNAME/A to the hub) routed to this group; TLS via the hub's --tls
+	ClientRequestTimeoutMS  int      `json:"client_request_timeout_ms,omitempty" yaml:"client_request_timeout_ms,omitempty"`
+	ServerResponseTimeoutMS int      `json:"server_response_timeout_ms,omitempty" yaml:"server_response_timeout_ms,omitempty"`
 }
 
 // Probe is a health check run by the agent next to the container.
@@ -307,6 +332,106 @@ type Node struct {
 	ConnectedSince  *time.Time        `json:"connected_since,omitempty"`
 	UptimeRatio     float64           `json:"uptime_ratio"`
 	CreateTime      time.Time         `json:"create_time"`
+	Assessment      *Assessment       `json:"assessment,omitempty"` // latest onboarding audit
+}
+
+// Assessment is the onboarding audit of a machine (`ogm assess`): what it has, how fast it
+// is, how well connected it is, and what the owner should keep for themselves.
+type Assessment struct {
+	Time            time.Time         `json:"time"`
+	Version         string            `json:"version"`
+	DurationSec     float64           `json:"duration_seconds"`
+	OS              string            `json:"os"`
+	Arch            string            `json:"arch"`
+	Kernel          string            `json:"kernel,omitempty"`
+	Environment     string            `json:"environment,omitempty"` // wsl2 | container | vm | ""
+	Laptop          bool              `json:"laptop,omitempty"`
+	UptimeHours     float64           `json:"uptime_hours,omitempty"`
+	CPU             AssessCPU         `json:"cpu"`
+	Memory          AssessMemory      `json:"memory"`
+	Disks           []AssessDisk      `json:"disks"`
+	GPUs            []GPU             `json:"gpus"`
+	GPUDriver       string            `json:"gpu_driver,omitempty"`
+	Runtime         AssessRuntime     `json:"runtime"`
+	Network         AssessNetwork     `json:"network"`
+	Profiles        []string          `json:"profiles"`
+	DetectedApps    []string          `json:"detected_apps,omitempty"`
+	Tier            string            `json:"tier"` // anchor | compute | burst | unsuitable
+	TierReasons     []string          `json:"tier_reasons,omitempty"`
+	Suggested       AssessLimits      `json:"suggested"`
+	Recommendations []Recommendation  `json:"recommendations"`
+	Errors          map[string]string `json:"errors,omitempty"` // check name -> why it was skipped/failed
+}
+
+// AssessCPU describes the processor and a short hashing benchmark.
+type AssessCPU struct {
+	Model      string  `json:"model,omitempty"`
+	Cores      int     `json:"cores"`   // physical cores (= threads if unknown)
+	Threads    int     `json:"threads"` // logical CPUs
+	Load1      float64 `json:"load1,omitempty"`
+	SingleMBps float64 `json:"single_thread_mbps,omitempty"` // SHA-256 throughput, one thread
+	MultiMBps  float64 `json:"multi_thread_mbps,omitempty"`  // SHA-256 throughput, all threads
+}
+
+// AssessMemory describes RAM.
+type AssessMemory struct {
+	TotalMB     int `json:"total_mb"`
+	AvailableMB int `json:"available_mb,omitempty"`
+	SwapMB      int `json:"swap_mb,omitempty"`
+}
+
+// AssessDisk describes a filesystem that matters to ogm (root, Docker data).
+type AssessDisk struct {
+	Path      string  `json:"path"`
+	Role      string  `json:"role"` // root | docker
+	TotalGB   int     `json:"total_gb"`
+	FreeGB    int     `json:"free_gb"`
+	WriteMBps float64 `json:"write_mbps,omitempty"` // sequential write with fsync
+}
+
+// AssessRuntime describes the container runtime.
+type AssessRuntime struct {
+	Docker        string `json:"docker,omitempty"` // server version, "" if unavailable
+	NvidiaRuntime bool   `json:"nvidia_runtime"`
+	GVisor        bool   `json:"gvisor"`
+	GVisorGPU     bool   `json:"gvisor_gpu"` // runsc nvproxy supports the installed driver
+}
+
+// AssessNetwork holds connectivity measurements.
+type AssessNetwork struct {
+	HubRTTms         float64 `json:"hub_rtt_ms,omitempty"`
+	HubDownMbps      float64 `json:"hub_down_mbps,omitempty"`
+	HubUpMbps        float64 `json:"hub_up_mbps,omitempty"`
+	InternetDownMbps float64 `json:"internet_down_mbps,omitempty"`
+	InternetUpMbps   float64 `json:"internet_up_mbps,omitempty"`
+	InternetRTTms    float64 `json:"internet_rtt_ms,omitempty"`
+	NAT              string  `json:"nat,omitempty"` // none | endpoint-independent | symmetric | udp-blocked | no-internet | unknown
+	IPv6             bool    `json:"ipv6"`
+}
+
+// AssessLimits are suggested `ogm agent` limits.
+type AssessLimits struct {
+	MaxCPU         int      `json:"max_cpu"`
+	MaxMemoryMB    int      `json:"max_memory_mb"`
+	MaxDiskGB      int      `json:"max_disk_gb"`
+	MaxGPUs        int      `json:"max_gpus"` // 0 = all, -1 = none
+	PauseOnProcess []string `json:"pause_on_process,omitempty"`
+	Window         string   `json:"window,omitempty"`
+	AgentFlags     string   `json:"agent_flags"`
+}
+
+// Recommendation is one piece of advice from the assessment.
+type Recommendation struct {
+	Level string `json:"level"` // info | warn | error
+	Topic string `json:"topic"` // cpu | memory | disk | gpu | network | runtime | usage
+	Text  string `json:"text"`
+}
+
+// Secret is a project secret (the value is only ever returned to containers, never by the API).
+type Secret struct {
+	Name       string    `json:"name"`
+	CreateTime time.Time `json:"create_time"`
+	UpdateTime time.Time `json:"update_time"`
 }
 
 // NodeToken is returned once when a node join token is created.
@@ -451,6 +576,17 @@ type User struct {
 	Nodes       int       `json:"nodes,omitempty"`
 	Contributed float64   `json:"contributed_credits,omitempty"`
 	Consumed    float64   `json:"consumed_credits,omitempty"`
+	// Credential describes the credential used for this request (GET /v1/me only).
+	Credential *Credential `json:"credential,omitempty"`
+}
+
+// Credential is the kind and scope of the credential behind a request.
+type Credential struct {
+	Type    string `json:"type"`              // user_key | api_key | instance
+	KeyID   string `json:"key_id,omitempty"`  // api_key
+	Project string `json:"project,omitempty"` // "" = every project the user can access
+	Role    string `json:"role"`              // admin | developer | viewer | instance, or the user's role for user keys
+	Group   string `json:"group,omitempty"`   // instance: the calling container group
 }
 
 // LedgerEntry is a credits transaction.

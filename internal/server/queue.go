@@ -2,10 +2,14 @@ package server
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"math/rand/v2"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -343,13 +347,18 @@ func (s *Server) deliverWebhooks() {
 	if len(due) == 0 {
 		return
 	}
-	secret, _ := s.st.GetSetting("webhook_secret")
 	var wg sync.WaitGroup
 	for _, x := range due {
 		wg.Add(1)
 		go func(x d) {
 			defer wg.Done()
-			err := s.postWebhook(secret, x.id, x.url, []byte(x.payload))
+			var pl struct {
+				Data struct {
+					Project string `json:"project_name"`
+				} `json:"data"`
+			}
+			_ = json.Unmarshal([]byte(x.payload), &pl)
+			err := s.postWebhook(s.webhookSecret(pl.Data.Project), x.id, x.url, []byte(x.payload))
 			if err == nil {
 				_, _ = s.st.DB.Exec(`UPDATE webhook_deliveries SET done=1, attempts=attempts+1 WHERE id=?`, x.id)
 				return
@@ -394,4 +403,17 @@ func rawOr(v json.RawMessage, def string) json.RawMessage {
 		return json.RawMessage(def)
 	}
 	return v
+}
+
+// webhookSecret is the project's webhook signing key: HMAC-SHA256 of the project
+// name under the cluster's master secret, base64-encoded (Standard Webhooks format).
+func (s *Server) webhookSecret(project string) string {
+	master, _ := s.st.GetSetting("webhook_secret")
+	key, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(master, "whsec_"))
+	if err != nil {
+		key = []byte(master)
+	}
+	m := hmac.New(sha256.New, key)
+	m.Write([]byte("ogm-webhook:" + project))
+	return base64.StdEncoding.EncodeToString(m.Sum(nil))
 }

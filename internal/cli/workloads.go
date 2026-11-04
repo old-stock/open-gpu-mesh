@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -47,7 +48,13 @@ func cmdDeploy(e *env, args []string) {
 		raw, err = os.ReadFile(*file)
 	}
 	check(err)
-	raw = []byte(os.ExpandEnv(string(raw)))
+	raw = []byte(ExpandVars(string(raw), os.Getenv))
+	deployRaw(e, raw, *file, *project, *dry)
+}
+
+// deployRaw applies every document in a deploy file: container groups (default), queues
+// (kind: queue) and schedules (kind: schedule).
+func deployRaw(e *env, raw []byte, file, project string, dry bool) {
 	dec := yaml.NewDecoder(bytes.NewReader(raw))
 	c := e.client()
 	for {
@@ -56,17 +63,17 @@ func cmdDeploy(e *env, args []string) {
 			if errors.Is(err, io.EOF) {
 				break
 			}
-			check(fmt.Errorf("parse %s: %w", *file, err))
+			check(fmt.Errorf("parse %s: %w", file, err))
 		}
 		var meta deployDoc
 		check(node.Decode(&meta))
-		proj := *project
+		proj := project
 		if meta.Project != "" {
 			proj = meta.Project
 		}
 		switch meta.Kind {
 		case "queue":
-			if *dry {
+			if dry {
 				e.json(meta)
 				continue
 			}
@@ -77,10 +84,25 @@ func cmdDeploy(e *env, args []string) {
 				check(c.Do(e.ctx, "POST", "/v1/projects/"+proj+"/queues", map[string]any{"name": meta.Name, "description": meta.Description, "settings": meta.Settings}, nil))
 				fmt.Fprintf(e.out, "queue %s/%s created\n", proj, meta.Name)
 			}
+		case "schedule":
+			var m map[string]any
+			check(node.Decode(&m))
+			delete(m, "kind")
+			delete(m, "project")
+			if dry {
+				e.json(m)
+				continue
+			}
+			check(c.Do(e.ctx, "PUT", "/v1/projects/"+proj+"/schedules/"+meta.Name, m, nil))
+			fmt.Fprintf(e.out, "schedule %s/%s saved\n", proj, meta.Name)
 		case "", "group", "container_group":
 			var spec api.ContainerGroupSpec
 			check(node.Decode(&spec))
-			if *dry {
+			var keys map[string]any
+			_ = node.Decode(&keys)
+			_, present := keys["replicas"]
+			spec.DefaultReplicas(present)
+			if dry {
 				e.json(spec)
 				continue
 			}
@@ -91,7 +113,7 @@ func cmdDeploy(e *env, args []string) {
 				fmt.Fprintf(e.out, "  gateway: %s\n", g.GatewayURL)
 			}
 		default:
-			fatalf("unknown kind %q (use group or queue)", meta.Kind)
+			fatalf("unknown kind %q (use group, queue or schedule)", meta.Kind)
 		}
 	}
 }
@@ -504,4 +526,18 @@ func printJob(e *env, j *api.Job) {
 			fmt.Fprintf(e.out, "output:\n%s\n", pretty.String())
 		}
 	}
+}
+
+var varRe = regexp.MustCompile(`\$?\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
+
+// ExpandVars replaces ${NAME} with get(NAME) in a deploy file. Only the braced form is
+// expanded so shell in container commands ($VAR, $((...)), $(...)) passes through untouched;
+// $${NAME} yields a literal ${NAME}.
+func ExpandVars(s string, get func(string) string) string {
+	return varRe.ReplaceAllStringFunc(s, func(m string) string {
+		if strings.HasPrefix(m, "$$") {
+			return m[1:]
+		}
+		return get(m[2 : len(m)-1])
+	})
 }

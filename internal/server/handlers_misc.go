@@ -31,6 +31,18 @@ func (s *Server) Handler() http.Handler {
 	s.registerGroupRoutes(mux)
 	s.registerQueueRoutes(mux)
 	s.registerMiscRoutes(mux)
+	s.registerAssessRoutes(mux)
+	s.registerSecretRoutes(mux)
+	s.registerVolumeRoutes(mux)
+	s.registerS3Routes(mux)
+	s.registerMCPRoutes(mux)
+	s.registerIAMRoutes(mux)
+	s.registerKVRoutes(mux)
+	s.registerScheduleRoutes(mux)
+	s.registerSnapshotRoutes(mux)
+	s.registerQuotaRoutes(mux)
+	s.registerMetricsRoutes(mux)
+	s.registerDocRoutes(mux)
 	mux.HandleFunc("GET /v1/agent/connect", s.handleConnect)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, "ok\n") })
 	mux.Handle("GET /", web.Handler())
@@ -44,6 +56,10 @@ func (s *Server) Handler() http.Handler {
 		}
 		if r.URL.Path == "/v2" || strings.HasPrefix(r.URL.Path, "/v2/") {
 			s.handleRegistry(w, r)
+			return
+		}
+		if r.URL.Path == "/s3" || strings.HasPrefix(r.URL.Path, "/s3/") {
+			s.handleS3(w, r)
 			return
 		}
 		w.Header().Set("X-OGM-Version", api.Version)
@@ -89,6 +105,9 @@ func (s *Server) nodeAPI(n *store.NodeRow) api.Node {
 		out.Owner = u.Name
 	}
 	_ = s.st.DB.QueryRow(`SELECT COUNT(*) FROM instances WHERE node_id=? AND state!='terminated'`, n.ID).Scan(&out.Instances)
+	if a, err := s.st.Assessment(n.ID); err == nil {
+		out.Assessment = a
+	}
 	return out
 }
 
@@ -99,7 +118,16 @@ func (s *Server) installCmd(token string) string {
 func (s *Server) registerMiscRoutes(mux *http.ServeMux) {
 	// ----- identity -----
 	mux.HandleFunc("GET /v1/me", s.authed(func(w http.ResponseWriter, r *http.Request, u *store.UserRow) {
-		writeJSON(w, http.StatusOK, s.userAPI(u))
+		out := s.userAPI(u)
+		cred := &api.Credential{Type: "user_key", Role: u.Role}
+		if sc := scopeFrom(r.Context()); sc != nil {
+			cred = &api.Credential{Type: "api_key", KeyID: sc.KeyID, Project: sc.Project, Role: sc.Role, Group: sc.Group}
+			if sc.Role == RoleInstance {
+				cred.Type, cred.KeyID = "instance", ""
+			}
+		}
+		out.Credential = cred
+		writeJSON(w, http.StatusOK, out)
 	}))
 	mux.HandleFunc("POST /v1/me/rotate-key", s.authed(func(w http.ResponseWriter, r *http.Request, u *store.UserRow) {
 		key, err := s.st.RotateUserKey(u.ID)
@@ -234,8 +262,16 @@ func (s *Server) registerMiscRoutes(mux *http.ServeMux) {
 		q := `SELECT p.name, p.owner_id, p.created FROM projects p`
 		var args []any
 		if u.Role != "admin" {
-			q += ` WHERE p.owner_id=? OR EXISTS (SELECT 1 FROM project_members m WHERE m.project=p.name AND m.user_id=?)`
+			q += ` WHERE (p.owner_id=? OR EXISTS (SELECT 1 FROM project_members m WHERE m.project=p.name AND m.user_id=?))`
 			args = append(args, u.ID, u.ID)
+		}
+		if sc := scopeFrom(r.Context()); sc != nil && sc.Project != "" {
+			if strings.Contains(q, "WHERE") {
+				q += ` AND p.name=?`
+			} else {
+				q += ` WHERE p.name=?`
+			}
+			args = append(args, sc.Project)
 		}
 		rows, err := s.st.DB.Query(q+` ORDER BY p.created`, args...)
 		if err != nil {
@@ -292,6 +328,9 @@ func (s *Server) registerMiscRoutes(mux *http.ServeMux) {
 		writeJSON(w, http.StatusCreated, api.Project{Name: body.Name, Owner: u.Name, Members: []string{u.Name}, CreateTime: time.Now().UTC()})
 	}))
 	mux.HandleFunc("POST /v1/projects/{project}/members", s.projected(func(w http.ResponseWriter, r *http.Request, u *store.UserRow, p string) {
+		if !s.projectManager(w, r, u, p) {
+			return
+		}
 		var body struct {
 			User string `json:"user"`
 		}
@@ -307,6 +346,9 @@ func (s *Server) registerMiscRoutes(mux *http.ServeMux) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	mux.HandleFunc("DELETE /v1/projects/{project}", s.projected(func(w http.ResponseWriter, r *http.Request, u *store.UserRow, p string) {
+		if !s.projectManager(w, r, u, p) {
+			return
+		}
 		var n int
 		_ = s.st.DB.QueryRow(`SELECT COUNT(*) FROM container_groups WHERE project=?`, p).Scan(&n)
 		if n > 0 {
@@ -405,6 +447,7 @@ func (s *Server) registerMiscRoutes(mux *http.ServeMux) {
 			ns.sess.Close()
 		}
 		_, _ = s.st.DB.Exec(`DELETE FROM nodes WHERE id=?`, n.ID)
+		_, _ = s.st.DB.Exec(`DELETE FROM node_assessments WHERE node_id=?`, n.ID)
 		s.Poke()
 		w.WriteHeader(http.StatusNoContent)
 	}))
@@ -431,15 +474,31 @@ func (s *Server) registerMiscRoutes(mux *http.ServeMux) {
 
 	// ----- webhook secret, cluster, jwks -----
 	mux.HandleFunc("GET /v1/webhook-secret", s.authed(func(w http.ResponseWriter, r *http.Request, u *store.UserRow) {
-		sec, _ := s.st.GetSetting("webhook_secret")
-		writeJSON(w, http.StatusOK, map[string]string{"secret_key": sec})
+		// Each project gets its own signing key, so members of one project cannot
+		// forge webhooks delivered to another project's receivers.
+		p := r.URL.Query().Get("project")
+		if p == "" {
+			p = "default"
+			if sc := scopeFrom(r.Context()); sc != nil && sc.Project != "" {
+				p = sc.Project
+			}
+		}
+		if sc := scopeFrom(r.Context()); sc != nil && sc.Project != "" && sc.Project != p {
+			problem(w, http.StatusForbidden, "forbidden", "this key is bound to project "+sc.Project)
+			return
+		}
+		if !s.projectAccess(w, u, p) {
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"secret_key": s.webhookSecret(p), "project": p})
 	}))
 	mux.HandleFunc("POST /v1/webhook-secret", s.admin(func(w http.ResponseWriter, r *http.Request, u *store.UserRow) {
 		sec := store.NewSecret(32)
 		b, _ := hex.DecodeString(sec)
 		enc := base64Std(b)
 		_ = s.st.SetSetting("webhook_secret", enc)
-		writeJSON(w, http.StatusOK, map[string]string{"secret_key": enc})
+		// Every project's key changes; return the default project's for convenience.
+		writeJSON(w, http.StatusOK, map[string]string{"secret_key": s.webhookSecret("default"), "project": "default"})
 	}))
 	mux.HandleFunc("GET /v1/cluster", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, s.clusterInfo())
@@ -458,7 +517,15 @@ func (s *Server) registerMiscRoutes(mux *http.ServeMux) {
 		s.serveFile(w, r, p, r.PathValue("path"))
 	}))
 	mux.HandleFunc("DELETE /v1/projects/{project}/files/{path...}", s.projected(func(w http.ResponseWriter, r *http.Request, u *store.UserRow, p string) {
-		fp := r.PathValue("path")
+		fp, ok := cleanFilePath(r.PathValue("path"))
+		if !ok {
+			problem(w, http.StatusBadRequest, "bad path", "invalid file path")
+			return
+		}
+		if reservedFilePath(fp) {
+			problem(w, http.StatusForbidden, "forbidden", "snapshots are managed through the snapshots API")
+			return
+		}
 		_, _ = s.st.DB.Exec(`DELETE FROM files WHERE project=? AND path=?`, p, fp)
 		_ = os.Remove(s.filePath(p, fp))
 		w.WriteHeader(http.StatusNoContent)
@@ -471,6 +538,14 @@ func (s *Server) registerMiscRoutes(mux *http.ServeMux) {
 		_ = decode(w, r, &body)
 		if body.ExpiresIn <= 0 {
 			body.ExpiresIn = 3600
+		}
+		if c, _ := cleanFilePath(r.PathValue("path")); body.Method != "" && !strings.EqualFold(body.Method, "GET") && reservedFilePath(c) {
+			problem(w, http.StatusForbidden, "forbidden", "snapshots are managed through the snapshots API")
+			return
+		}
+		if body.ExpiresIn > 7*24*3600 {
+			validationProblem(w, map[string][]string{"expires_in_s": {"must be at most 604800 (7 days)"}})
+			return
 		}
 		if body.Method == "" {
 			body.Method = "GET"
@@ -579,6 +654,43 @@ func (s *Server) filesRoot() string {
 	return filepath.Join(s.cfg.DataDir, "files")
 }
 
+// reservedFilePath reports paths the files API may not write or delete: snapshot
+// archives live under .snapshots/ and are only managed by the snapshots API.
+func reservedFilePath(p string) bool {
+	return p == ".snapshots" || strings.HasPrefix(p, ".snapshots/")
+}
+
+// setUserContentHeaders makes user-uploaded content safe to serve from the hub's
+// origin: it can never run script there (CSP sandbox, nosniff), and anything a
+// browser might render as a document is downloaded instead of displayed.
+func setUserContentHeaders(h http.Header, ct, name string) {
+	h.Set("Content-Type", ct)
+	hardenUserContent(h, name)
+}
+
+// hardenUserContent applies the user-content policy to the headers already set.
+func hardenUserContent(h http.Header, name string) {
+	ct := h.Get("Content-Type")
+	if ct == "" {
+		ct = "application/octet-stream"
+		h.Set("Content-Type", ct)
+	}
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("Content-Security-Policy", "sandbox; default-src 'none'; img-src 'self' data:; media-src 'self'; style-src 'unsafe-inline'")
+	mt := strings.ToLower(strings.TrimSpace(strings.SplitN(ct, ";", 2)[0]))
+	switch {
+	case strings.HasPrefix(mt, "image/") && mt != "image/svg+xml",
+		strings.HasPrefix(mt, "audio/"), strings.HasPrefix(mt, "video/"),
+		mt == "text/plain", mt == "text/csv", mt == "application/json", mt == "application/pdf", mt == "application/octet-stream":
+	default:
+		if name == "" {
+			h.Set("Content-Disposition", "attachment")
+		} else {
+			h.Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": name}))
+		}
+	}
+}
+
 func cleanFilePath(p string) (string, bool) {
 	c := path.Clean("/" + p)
 	if c == "/" || strings.Contains(p, "..") {
@@ -599,10 +711,16 @@ func (s *Server) signFile(method, project, p string, exp int64) string {
 	return hex.EncodeToString(m.Sum(nil))
 }
 
-func (s *Server) handlePutFile(w http.ResponseWriter, r *http.Request, _ *store.UserRow, project string) {
+// handlePutFile stores an upload. u is nil for hub-signed URLs, which is how agents
+// upload snapshot archives; user requests may not write under .snapshots/.
+func (s *Server) handlePutFile(w http.ResponseWriter, r *http.Request, u *store.UserRow, project string) {
 	fp, ok := cleanFilePath(r.PathValue("path"))
 	if !ok {
 		problem(w, http.StatusBadRequest, "bad path", "invalid file path")
+		return
+	}
+	if u != nil && reservedFilePath(fp) {
+		problem(w, http.StatusForbidden, "forbidden", "snapshots are managed through the snapshots API")
 		return
 	}
 	dst := s.filePath(project, fp)
@@ -616,11 +734,28 @@ func (s *Server) handlePutFile(w http.ResponseWriter, r *http.Request, _ *store.
 		return
 	}
 	h := sha256.New()
-	n, err := io.Copy(io.MultiWriter(tmp, h), io.LimitReader(r.Body, 50<<30))
+	limit := int64(50 << 30)
+	if left := s.storageRemaining(project); left >= 0 {
+		var old int64 // overwriting a file frees its old size
+		_ = s.st.DB.QueryRow(`SELECT size FROM files WHERE project=? AND path=?`, project, fp).Scan(&old)
+		if left+old < limit {
+			limit = left + old
+		}
+	}
+	n, err := io.Copy(io.MultiWriter(tmp, h), io.LimitReader(r.Body, limit+1))
 	tmp.Close()
 	if err != nil {
 		os.Remove(tmp.Name())
 		problem(w, http.StatusBadRequest, "upload failed", err.Error())
+		return
+	}
+	if n > limit {
+		os.Remove(tmp.Name())
+		if limit < 50<<30 {
+			problem(w, http.StatusForbidden, "quota exceeded", fmt.Sprintf("the project's storage quota allows %d more bytes", limit))
+		} else {
+			problem(w, http.StatusRequestEntityTooLarge, "too large", "files are limited to 50 GiB")
+		}
 		return
 	}
 	if err := os.Rename(tmp.Name(), dst); err != nil {
@@ -660,7 +795,7 @@ func (s *Server) serveFile(w http.ResponseWriter, r *http.Request, project, p st
 	}
 	defer f.Close()
 	st, _ := f.Stat()
-	w.Header().Set("Content-Type", ct)
+	setUserContentHeaders(w.Header(), ct, path.Base(fp))
 	http.ServeContent(w, r, path.Base(fp), st.ModTime(), f)
 }
 
@@ -718,9 +853,24 @@ func (s *Server) handleInstallScript(w http.ResponseWriter, r *http.Request) {
 }
 
 const installScript = `#!/bin/sh
-# open-gpu-mesh agent installer. Usage: curl -fsSL <server>/install.sh | sh -s -- --token <node-token> [agent flags]
+# open-gpu-mesh agent installer.
+# Usage: curl -fsSL <server>/install.sh | sh -s -- --token <node-token> [--profile gaming,cad] [--no-assess] [agent flags]
+# The installer audits the machine (hardware, speed test, NAT) and applies suggested limits;
+# agent flags you pass explicitly (e.g. --max-cpu 4) override the suggestions.
 set -eu
 SERVER="%s"
+TOKEN=""; PROFILE=""; ASSESS=1; ARGS=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --token) TOKEN="$2"; ARGS="$ARGS --token $2"; shift 2;;
+    --token=*) TOKEN="${1#--token=}"; ARGS="$ARGS $1"; shift;;
+    --profile) PROFILE="$2"; shift 2;;
+    --profile=*) PROFILE="${1#--profile=}"; shift;;
+    --no-assess) ASSESS=0; shift;;
+    *) ARGS="$ARGS $1"; shift;;
+  esac
+done
+[ -n "$TOKEN" ] || { echo "usage: install.sh --token <node-token> [--profile ...] [agent flags]"; exit 1; }
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 ARCH=$(uname -m)
 case "$ARCH" in x86_64|amd64) ARCH=amd64;; aarch64|arm64) ARCH=arm64;; *) echo "unsupported arch $ARCH"; exit 1;; esac
@@ -735,6 +885,20 @@ if ! command -v docker >/dev/null 2>&1; then
   echo "!!  docker not found. Install Docker (and the NVIDIA Container Toolkit for GPUs) first:"
   echo "    https://docs.docker.com/engine/install/  and  https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/"
 fi
+SUGGESTED=""
+if [ "$ASSESS" = 1 ]; then
+  echo "==> auditing this machine (about 30 s: hardware, CPU/disk benchmark, speed test, NAT type)"
+  set -- --server "$SERVER" --token "$TOKEN" --quick --flags-only
+  [ -n "$PROFILE" ] && set -- "$@" --profile "$PROFILE"
+  if [ -z "$PROFILE" ] && (exec </dev/tty) 2>/dev/null; then
+    SUGGESTED=$("$BIN" assess "$@" </dev/tty) || SUGGESTED=""
+  else
+    SUGGESTED=$("$BIN" assess "$@" </dev/null) || SUGGESTED=""
+  fi
+  [ -n "$SUGGESTED" ] && echo "==> applying suggested limits: $SUGGESTED"
+fi
+# Suggested flags come first so explicitly passed flags win (last flag wins).
+AGENT_ARGS="$SUGGESTED$ARGS"
 if command -v systemctl >/dev/null 2>&1 && [ -d /etc/systemd/system ]; then
   echo "==> installing systemd service ogm-agent"
   $SUDO tee /etc/systemd/system/ogm-agent.service >/dev/null <<UNIT
@@ -744,8 +908,8 @@ After=network-online.target docker.service
 Wants=network-online.target
 
 [Service]
-ExecStart=$BIN agent --server $SERVER $*
-ExecReload=/bin/kill -HUP $MAINPID
+ExecStart=$BIN agent --server $SERVER $AGENT_ARGS
+ExecReload=/bin/kill -HUP \$MAINPID
 Restart=always
 RestartSec=5
 
@@ -754,10 +918,10 @@ WantedBy=multi-user.target
 UNIT
   $SUDO systemctl daemon-reload
   $SUDO systemctl enable --now ogm-agent
-  echo "==> done. Logs: journalctl -u ogm-agent -f"
+  echo "==> done. Logs: journalctl -u ogm-agent -f   Re-audit any time: ogm assess --token <node-token>"
 else
   echo "==> no systemd; run manually:"
-  echo "    $BIN agent --server $SERVER $*"
+  echo "    $BIN agent --server $SERVER $AGENT_ARGS"
 fi
 `
 

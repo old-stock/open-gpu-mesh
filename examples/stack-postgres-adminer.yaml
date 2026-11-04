@@ -1,0 +1,42 @@
+# A two-tier stack in one file: PostgreSQL (persistent, internal only) plus a web UI that
+# scales to zero when nobody is using it and starts on the first request.
+#   ogm secret set pg-password
+#   ogm deploy -f examples/stack-postgres-adminer.yaml
+#   ogm url adminer          # open it; log in as "app" with the pg-password secret
+name: postgres
+replicas: 1
+priority: high
+container:
+  image: postgres:17
+  env:
+    POSTGRES_USER: app
+    POSTGRES_DB: app
+    POSTGRES_PASSWORD: "{{secret:pg-password}}"
+    PGDATA: /var/lib/postgresql/data/pgdata
+  ports: [5432]
+  volumes:
+    - { name: data, mount: /var/lib/postgresql/data }
+  resources: { cpu: 1, memory_mb: 1024 }
+readiness_probe:
+  tcp: { port: 5432 }
+  period_seconds: 5
+---
+name: adminer
+replicas: 0
+priority: medium
+container:
+  image: adminer:latest
+  env:
+    ADMINER_DEFAULT_SERVER: "{{link:postgres:5432}}"   # resolved to a local relay address on the node
+  resources: { cpu: 1, memory_mb: 256 }
+networking:
+  port: 8080
+  auth: true
+  max_concurrency: 50
+http_autoscaler:
+  min_replicas: 0                # scale to zero when idle
+  max_replicas: 3
+  target_concurrency: 20         # add a replica per 20 concurrent requests
+  scale_down_delay_seconds: 600  # stay warm 10 min after the last request
+readiness_probe:
+  http: { path: /, port: 8080 }

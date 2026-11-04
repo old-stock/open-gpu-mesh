@@ -45,7 +45,29 @@ ogm node add alice-4090            # run by the member; prints the install line 
 curl -fsSL https://gpu.example.com/install.sh | sh -s -- --token ogmn_...
 ```
 
-The installer sets up a systemd service. To run the agent by hand:
+The installer first **audits the machine** (about 30 seconds): hardware inventory, a short CPU and disk benchmark, latency and parallel speed tests to the hub and to the internet (speed.cloudflare.com), and NAT type via public STUN servers. It asks how the owner uses the machine (or takes `--profile gaming,workstation,...`), then applies suggested limits so the owner keeps enough for themselves. Flags passed to the installer override the suggestions; `--no-assess` skips the audit. Then it sets up a systemd service.
+
+Run the audit on its own any time; with a node token it also stores the result on the hub (`ogm nodes` shows the tier, and the dashboard shows tier, speed and advice):
+
+```sh
+ogm assess --profile gaming,dev                      # report + suggested agent flags
+ogm assess --token ogmn_... --server https://gpu.example.com   # also hub speed test, stored on the hub
+ogm node assessment node_abc123                      # view a stored audit
+```
+
+| Profile | Keeps for the owner |
+|---|---|
+| `general` | 2 cores, 4 GB RAM, 50 GB disk |
+| `gaming` | 4 cores, 16 GB RAM, 200 GB disk; GPU yields when busy (`--yield-gpu-util 30`) |
+| `workstation` (CAD) | 8 cores, 32 GB RAM, 100 GB disk; pauses while CAD apps run |
+| `creative` | 8 cores, 16 GB RAM, 150 GB disk; pauses while Blender/Resolve/After Effects run |
+| `dev` | 4 cores, 16 GB RAM, 100 GB disk |
+| `ml` | 2 cores, 8 GB RAM, 100 GB disk, plus memory in use now; one GPU kept if there are several |
+| `server` | 2 cores, 4 GB RAM, 50 GB disk, plus memory and CPU in use now |
+
+The audit also assigns a **tier**: `anchor` (always-on, ≥50 Mbps up and ≥100 down, ≥200 GB free, internet-reachable: suited to storage and services later), `compute`, `burst` (laptops, slow uplinks, blocked UDP) or `unsuitable`. Machines without an NVIDIA GPU become CPU-only nodes that run `gpu_count: 0` workloads.
+
+To run the agent by hand:
 
 ```sh
 ogm agent --server https://gpu.example.com --token ogmn_... \

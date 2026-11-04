@@ -1,0 +1,4390 @@
+# OpenAPI description of the open-gpu-mesh hub. This file is the single source of truth for
+# the API reference served at /docs, /openapi.json, /openapi.yaml and /llms.txt, and for
+# docs/api-surface.md. internal/server/docs_test.go fails if a route registered on the hub's
+# mux is missing here (or an operation here has no route), so keep it in sync with the code.
+#
+# Placeholders replaced at serve time: __OGM_VERSION__ (api.Version), __OGM_HUB__ (public URL).
+# x-ogm-cli: the equivalent `ogm` CLI command (appended to the description when served).
+# x-ogm-protocol: true marks protocol endpoints that are dispatched outside the route mux
+# (gateway, OCI registry, S3); the drift test skips them.
+openapi: 3.1.0
+info:
+  title: open-gpu-mesh API
+  version: "__OGM_VERSION__"
+  summary: Run containers, queues and storage on a pool of community GPUs.
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+  contact:
+    name: open-gpu-mesh
+    url: https://github.com/old-stock/open-gpu-mesh
+  description: |
+    **open-gpu-mesh** (`ogm`) is a self-hosted "neocloud": one hub binary plus an agent on every
+    machine that shares its GPU. This is the hub's REST API. The CLI (`ogm`), the web dashboard
+    and the MCP server are all thin clients of it, so everything they can do, you can do here.
+
+    ## Quick start
+
+    ```sh
+    export OGM=https://gpu.example.com   # your hub
+    export KEY=ogm_...                   # from `ogm join` or an admin
+    curl -H "Authorization: Bearer $KEY" $OGM/v1/me
+    curl -H "Authorization: Bearer $KEY" $OGM/v1/projects/default/containers
+    ```
+
+    Deploy a GPU container group with a public HTTPS endpoint:
+
+    ```sh
+    curl -X PUT -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+      $OGM/v1/projects/default/containers/hello -d '{
+        "replicas": 1,
+        "container": {"image": "ghcr.io/old-stock/ogm-demo:latest",
+                      "resources": {"cpu": 2, "memory_mb": 4096, "gpu_count": 1}},
+        "networking": {"port": 8080, "auth": true}
+      }'
+    ```
+
+    ## Authentication
+
+    Send a credential as `Authorization: Bearer <credential>` or as the `OGM-Api-Key` header.
+    Three kinds of credential are accepted:
+
+    | Credential | Looks like | Where it comes from | Scope |
+    |---|---|---|---|
+    | Personal API key | `ogm_…` | `POST /v1/join`, `POST /v1/me/rotate-key` | everything your user can do |
+    | Scoped API key | `ogmk_…` | `POST /v1/keys` | one project (optional), a role, an expiry |
+    | Instance identity | a JWT (`eyJ…`) | `GET $OGM_IMDS_URL/v1/token?audience=ogm-hub` inside a container | the container's own project, data-plane only |
+
+    Scoped credentials carry a **role**:
+
+    | Role | May do |
+    |---|---|
+    | `admin` | everything the owning user can do, including admin endpoints (only admins can mint these) |
+    | `developer` | member-level access: read and write in its project(s), manage its own keys; never admin endpoints |
+    | `viewer` | read-only: `GET`/`HEAD` only |
+    | `instance` | workload identity: `kv`, `files`, `file-tokens` and queue **jobs** of its own project, and read `containers`/`events`; plus `GET /v1/me`, `/v1/gpu-classes`, `/v1/availability`, `/v1/cluster` |
+
+    A project-scoped key may only touch `/v1/projects/{its project}/…` (plus the read-only
+    cluster endpoints above). Users themselves are either `admin` or `member`; members see the
+    projects they own or belong to, admins see everything.
+
+    Other credentials you will meet: **node tokens** (`ogmn_…`, used by agents),
+    **gateway share tokens** (`ogmg_…`, only valid for one group's gateway), and
+    **S3 access keys** (`OGMS3…`, SigV4, only valid at `/s3`).
+
+    ## Errors
+
+    Errors are [RFC 7807](https://www.rfc-editor.org/rfc/rfc7807) problem details with
+    `Content-Type: application/problem+json`. Validation errors carry a per-field `errors` map:
+
+    ```json
+    {"type": "https://ogm.dev/errors/validation", "title": "validation failed", "status": 400,
+     "errors": {"container.image": ["is required"], "replicas": ["must be between 0 and 1000"]}}
+    ```
+
+    | Status | Meaning |
+    |---|---|
+    | 400 | invalid JSON, invalid parameter or validation failure |
+    | 401 | missing, invalid or expired credential |
+    | 403 | authenticated but not allowed (not a project member, admin only, scoped key limits) |
+    | 404 | resource (or project) not found |
+    | 409 | conflict: already exists, in use, node offline, wrong state |
+    | 412 | precondition failed (KV compare-and-set) |
+
+    The protocol endpoints use their protocol's error format: OCI registry errors at `/v2/`,
+    S3 XML errors at `/s3/`.
+
+    ## Lists and pagination
+
+    Collections are returned as `{"items": [...]}`, newest-first or name-ordered as noted per
+    endpoint. Most lists are small and unpaginated; long ones take `limit` (events, logs, jobs,
+    files, ledger) and the KV key listing pages with `after` / `next_after`.
+
+    ## Conventions
+
+    - Names (projects, groups, queues, users) are DNS labels: `^[a-z][a-z0-9-]{0,61}[a-z0-9]$`.
+    - Timestamps are RFC 3339 UTC. Durations in names carry their unit (`_ms`, `_s`, `_hours`).
+    - `PUT` on a container group or schedule is a declarative upsert; `PATCH` on a group is an
+      [RFC 7386](https://www.rfc-editor.org/rfc/rfc7386) JSON merge patch.
+    - Every response carries `X-OGM-Version` with the hub version.
+
+    ## Rate of change
+
+    The API is versioned under `/v1` and changes additively: new fields and endpoints appear
+    without notice, existing fields are not renamed or removed within `/v1`. Clients should
+    ignore unknown fields. This document is generated from the running hub
+    (`GET /openapi.json`), and CI fails if any route is undocumented, so it always matches the
+    server you are talking to.
+
+    ## More
+
+    - **CLI:** every operation lists its `ogm` equivalent. `ogm --help` for the full list.
+    - **Guides:** [quickstart](https://github.com/old-stock/open-gpu-mesh/blob/HEAD/docs/quickstart.md), [spec reference](https://github.com/old-stock/open-gpu-mesh/blob/HEAD/docs/spec-reference.md)
+      (every container group field), [cluster services](https://github.com/old-stock/open-gpu-mesh/blob/HEAD/docs/services.md) (KV, schedules,
+      snapshots, scoped keys, instance identity, metrics, custom domains, templates),
+      [API overview](https://github.com/old-stock/open-gpu-mesh/blob/HEAD/docs/api.md) (gateway, job delivery, webhooks, IMDS).
+    - **MCP:** AI assistants can drive the cluster through the [MCP endpoint](#tag/mcp)
+      (`POST /v1/mcp`); see [docs/mcp.md](https://github.com/old-stock/open-gpu-mesh/blob/HEAD/docs/mcp.md).
+    - **S3:** an S3-compatible object store lives at `/s3`; see [S3 API](#tag/s3-api) and
+      [docs/s3.md](https://github.com/old-stock/open-gpu-mesh/blob/HEAD/docs/s3.md).
+    - **Registry:** an OCI registry lives at `/v2/`; see [Registry](#tag/registry).
+    - **Machine-readable:** [`/openapi.json`](/openapi.json), [`/openapi.yaml`](/openapi.yaml),
+      [`/llms.txt`](/llms.txt).
+servers:
+  - url: "{hub}"
+    description: Your open-gpu-mesh hub
+    variables:
+      hub:
+        default: "__OGM_HUB__"
+        description: Base URL of the hub, e.g. https://gpu.example.com (no trailing slash).
+security:
+  - bearerAuth: []
+  - apiKeyHeader: []
+tags:
+  - name: Account & users
+    description: |
+      Who you are, your credits, invites and cluster membership. Users are `admin` or
+      `member`. Joining with an invite creates a user, a personal project named after the user,
+      membership of the shared `default` project, and a personal API key.
+  - name: Projects
+    description: |
+      Projects namespace every workload resource: container groups, queues, secrets, volumes,
+      KV, files, schedules and S3 buckets. Members of a project share everything in it.
+  - name: Container groups
+    description: |
+      A container group is N replicas of one container image, placed on contributor nodes
+      that satisfy its resource needs. Optionally exposed through the HTTPS gateway, attached
+      to a job queue, and autoscaled on queue depth or concurrent requests. See the
+      [spec reference](https://github.com/old-stock/open-gpu-mesh/blob/HEAD/docs/spec-reference.md) for every field, and
+      [custom domains](https://github.com/old-stock/open-gpu-mesh/blob/HEAD/docs/services.md#custom-domains-and-tls) for `networking.custom_domains`.
+  - name: Instances
+    description: |
+      An instance is one replica of a group placed on a node. Instances move through
+      `allocating → downloading → creating → running → stopping → terminated`.
+  - name: Logs & events
+    description: |
+      Container stdout/stderr (searchable, followable as Server-Sent Events) and lifecycle
+      events for groups, projects and the whole cluster.
+  - name: Gateway
+    description: |
+      The HTTPS gateway proxies requests to a group's ready instances, with load balancing,
+      cold-start waiting, retries, websockets and streaming. Path mode:
+      `/gw/{project}/{group}/…`; host mode: `https://{group}-{project}.{gateway-domain}/…`.
+  - name: Queues & jobs
+    description: |
+      Durable FIFO job queues. Groups with a `queue_connection` receive jobs as HTTP POSTs to
+      their container; failed attempts are retried with backoff on other instances. Finished
+      jobs can call a webhook signed per [Standard Webhooks](https://www.standardwebhooks.com/).
+  - name: Schedules
+    description: |
+      Cron schedules that submit a job, call a group over HTTP, or set a group's replica
+      count (EventBridge Scheduler / Cloud Scheduler style). 5-field cron in the hub's time zone.
+      Guide: [schedules](https://github.com/old-stock/open-gpu-mesh/blob/HEAD/docs/services.md#schedules).
+  - name: Secrets
+    description: |
+      Encrypted (AES-256-GCM) project secrets, referenced from container env as
+      `{{secret:NAME}}`. Values are write-only: the API never returns them.
+  - name: Volumes & snapshots
+    description: |
+      Persistent per-replica volumes (`container.volumes`) live on the node that first ran the
+      replica, which pins the replica there. Snapshots copy a replica's volumes into the hub as
+      a `.tar.gz` and can restore them onto the same or another node (volume migration).
+      Guide: [volume snapshots](https://github.com/old-stock/open-gpu-mesh/blob/HEAD/docs/services.md#volume-snapshots-and-migration).
+  - name: KV store
+    description: |
+      A small per-project key-value store (DynamoDB-lite / Redis-lite over HTTP): tables of
+      keys with byte values up to 1 MiB, versions for compare-and-set via `If-Match`, TTLs and
+      atomic counters. Lives in the hub's database, so it survives any node going away.
+      Guide: [key-value store](https://github.com/old-stock/open-gpu-mesh/blob/HEAD/docs/services.md#key-value-store).
+  - name: Files
+    description: |
+      A simple per-project file store on the hub, with HMAC-signed URLs for sharing a single
+      file (download or upload) without a key.
+  - name: S3 credentials
+    description: |
+      Project-scoped S3 access key pairs for the S3-compatible store at `/s3`. The secret is
+      shown once, at creation.
+  - name: S3 API
+    description: |
+      S3-compatible object storage (path-style, SigV4). Use boto3, aws-cli, rclone or any AWS
+      SDK with `endpoint_url = {hub}/s3`. These operations follow the AWS S3 REST API and return
+      S3 XML; they are listed here for discovery. Full details: [docs/s3.md](https://github.com/old-stock/open-gpu-mesh/blob/HEAD/docs/s3.md).
+  - name: API keys
+    description: |
+      Scoped API keys (`ogmk_…`): limited to one project (optional), a role (`admin`,
+      `developer`, `viewer`) and an expiry. Use them for CI, Prometheus and third-party tools
+      instead of your personal key. Guide: [scoped API keys](https://github.com/old-stock/open-gpu-mesh/blob/HEAD/docs/services.md#scoped-api-keys)
+      and [instance identity](https://github.com/old-stock/open-gpu-mesh/blob/HEAD/docs/services.md#instance-identity).
+  - name: Nodes & assessment
+    description: |
+      Contributor machines running `ogm agent`. Create a join token, install the agent, and the
+      node appears here with its GPUs. Every node can carry an onboarding assessment (hardware,
+      benchmarks, network, suggested limits).
+  - name: GPUs & availability
+    description: GPU classes (models), their credit prices per priority, and live availability.
+  - name: Metrics
+    description: |
+      Per-group per-minute series (requests, errors, latency percentiles, replicas, CPU,
+      memory, GPU) and a Prometheus scrape endpoint for the whole hub.
+      Guide: [metrics](https://github.com/old-stock/open-gpu-mesh/blob/HEAD/docs/services.md#metrics).
+  - name: Registry
+    description: |
+      A built-in [OCI Distribution](https://github.com/opencontainers/distribution-spec)
+      registry at `/v2/`. Repositories are `{project}/{name}`; images are referenced in specs
+      as `registry.ogm/{project}/{name}:{tag}`. `docker login` works with your personal API key
+      as the password.
+  - name: MCP
+    description: |
+      A [Model Context Protocol](https://modelcontextprotocol.io) server (Streamable HTTP) so
+      AI assistants can operate the cluster with your permissions. See [docs/mcp.md](https://github.com/old-stock/open-gpu-mesh/blob/HEAD/docs/mcp.md).
+  - name: Agent (internal)
+    description: |
+      Endpoints used by `ogm agent` and `ogm assess` with a node token (`ogmn_…`). Documented
+      for completeness; you don't call these yourself.
+  - name: Misc
+    description: Cluster info, health, installer, binaries, JWKS, the dashboard and these docs.
+x-tagGroups:
+  - name: Identity & access
+    tags: [Account & users, Projects, API keys]
+  - name: Compute
+    tags: [Container groups, Instances, Logs & events, Gateway, Metrics]
+  - name: Jobs & automation
+    tags: [Queues & jobs, Schedules]
+  - name: Data
+    tags: [Secrets, Volumes & snapshots, KV store, Files, S3 credentials, S3 API, Registry]
+  - name: Cluster
+    tags: [Nodes & assessment, GPUs & availability]
+  - name: Protocols & internals
+    tags: [MCP, Agent (internal), Misc]
+paths:
+  # ------------------------------------------------------------------ Account & users
+  /v1/me:
+    get:
+      operationId: getMe
+      tags: [Account & users]
+      summary: Get the current user
+      description: |
+        Returns the user behind the credential: name, role, credit balance and contribution
+        stats. With a scoped key or instance identity it returns the key's owning user (an
+        instance identity resolves to the project owner, with role `member`).
+      x-ogm-cli: ogm status
+      responses:
+        "200":
+          description: The current user.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/User"}
+              example:
+                id: usr_8f2k1
+                name: alice
+                role: member
+                credits: 42.5
+                create_time: "2026-10-01T12:00:00Z"
+                nodes: 2
+                contributed_credits: 120.25
+                consumed_credits: 87.75
+        "401": {$ref: "#/components/responses/Unauthorized"}
+  /v1/me/rotate-key:
+    post:
+      operationId: rotateMyKey
+      tags: [Account & users]
+      summary: Rotate your personal API key
+      description: |
+        Issues a new personal `ogm_…` key and invalidates the old one immediately. The new key is
+        returned once, in `api_key`. Scoped keys (`ogmk_…`) you created keep working.
+      responses:
+        "200":
+          description: The user, with the new key in `api_key`.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/User"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+  /v1/me/ledger:
+    get:
+      operationId: getMyLedger
+      tags: [Account & users]
+      summary: List your credit transactions
+      description: |
+        Your credits ledger, newest first. `reason` is `contribution` (your nodes ran someone's
+        work), `usage` (your workloads ran), `grant` (an admin granted credits) or `starter`.
+      x-ogm-cli: ogm credits
+      parameters:
+        - name: limit
+          in: query
+          description: Maximum entries to return.
+          schema: {type: integer, default: 100, minimum: 1}
+      responses:
+        "200":
+          description: Ledger entries, newest first.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/LedgerEntryList"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+  /v1/invites:
+    post:
+      operationId: createInvite
+      tags: [Account & users]
+      summary: Create an invite code
+      description: |
+        **Admin only.** Creates an invite code that lets people join the cluster with
+        `POST /v1/join`. Defaults: role `member`, 1 use, valid for 7 days. The response includes
+        a ready-to-paste `join_command`.
+      x-ogm-cli: ogm invite [--uses N] [--admin]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                role: {type: string, enum: [member, admin], default: member}
+                uses: {type: integer, minimum: 1, default: 1, description: "How many people can join with this code."}
+                ttl_hours: {type: integer, minimum: 1, default: 168, description: "Lifetime of the code in hours."}
+            example: {role: member, uses: 5, ttl_hours: 48}
+      responses:
+        "201":
+          description: The invite.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Invite"}
+              example:
+                code: inv_3b9c0e1f2a4d6e8f0a1b
+                role: member
+                uses_left: 5
+                expires: "2026-11-05T12:00:00Z"
+                join_command: ogm join https://gpu.example.com inv_3b9c0e1f2a4d6e8f0a1b --name <your-name>
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+  /v1/join:
+    post:
+      operationId: joinCluster
+      tags: [Account & users]
+      summary: Join the cluster with an invite
+      description: |
+        **Public.** Redeems an invite code and creates a user. The user gets the invite's role,
+        the hub's starter credits, a personal project named after them, and membership of the
+        `default` project. The personal API key is returned once, in `api_key`; store it.
+      x-ogm-cli: ogm join SERVER INVITE_CODE --name NAME
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code, name]
+              properties:
+                code: {type: string, description: "Invite code (`inv_…`)."}
+                name: {type: string, pattern: "^[a-z][a-z0-9-]{0,61}[a-z0-9]$", description: "User name (DNS label)."}
+            example: {code: inv_3b9c0e1f2a4d6e8f0a1b, name: alice}
+      responses:
+        "201":
+          description: The new user, with `api_key`.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/User"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "403":
+          description: The invite code is invalid, used up or expired.
+          content:
+            application/problem+json:
+              schema: {$ref: "#/components/schemas/Problem"}
+              example: {type: "https://ogm.dev/errors/invalid_invite", title: invalid invite, status: 403, detail: "invite code is invalid, used up or expired"}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /v1/users:
+    get:
+      operationId: listUsers
+      tags: [Account & users]
+      summary: List users (leaderboard)
+      description: |
+        All users of the cluster, sorted by contributed credits (the leaderboard). Any member
+        can call it.
+      x-ogm-cli: ogm users
+      responses:
+        "200":
+          description: Users, top contributors first.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/UserList"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+  /v1/users/{name}:
+    patch:
+      operationId: updateUser
+      tags: [Account & users]
+      summary: Change a user's role or grant credits
+      description: |
+        **Admin only.** Sets the user's role (`admin` or `member`; other values are ignored)
+        and/or adds `grant_credits` to their balance (negative values deduct). Both fields are
+        optional.
+      parameters:
+        - name: name
+          in: path
+          required: true
+          description: User name.
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                role: {type: string, enum: [admin, member]}
+                grant_credits: {type: number, description: "Credits to add (ledger reason `grant`)."}
+            example: {grant_credits: 25}
+      responses:
+        "200":
+          description: The updated user.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/User"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  # ------------------------------------------------------------------ Projects
+  /v1/projects:
+    get:
+      operationId: listProjects
+      tags: [Projects]
+      summary: List projects
+      description: Projects you own or are a member of (admins see all), oldest first, with their members.
+      responses:
+        "200":
+          description: Projects.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ProjectList"}
+              example:
+                items:
+                  - {name: default, owner: admin, members: [admin, alice], create_time: "2026-10-01T12:00:00Z"}
+                  - {name: alice, owner: alice, members: [alice], create_time: "2026-10-02T09:30:00Z"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+    post:
+      operationId: createProject
+      tags: [Projects]
+      summary: Create a project
+      description: Creates a project owned by you, with you as its only member.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: {$ref: "#/components/schemas/Name"}
+            example: {name: research}
+      responses:
+        "201":
+          description: The project.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Project"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /v1/projects/{project}:
+    delete:
+      operationId: deleteProject
+      tags: [Projects]
+      summary: Delete a project
+      description: |
+        Deletes an empty project and its memberships. Refused with `409 project not empty`
+        while it still has container groups.
+      parameters:
+        - {$ref: "#/components/parameters/Project"}
+      responses:
+        "204": {description: "Deleted."}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /v1/projects/{project}/members:
+    post:
+      operationId: addProjectMember
+      tags: [Projects]
+      summary: Add a member to a project
+      description: Adds an existing user to the project. Idempotent. Any member may add others.
+      parameters:
+        - {$ref: "#/components/parameters/Project"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user]
+              properties:
+                user: {type: string, description: "User name to add."}
+            example: {user: bob}
+      responses:
+        "204": {description: "Added (or already a member)."}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /v1/projects/{project}/quota:
+    parameters:
+      - {$ref: "#/components/parameters/Project"}
+    get:
+      operationId: getProjectQuota
+      tags: [Projects]
+      summary: Get a project's quota and usage
+      description: |
+        The project's limits and its current claim. Compute usage counts every group at its
+        **peak** replica count (the max of `replicas`, autoscaler `max_replicas`, enabled
+        `scaling_actions` and the current desired count), so autoscalers and schedules can never
+        exceed the quota. Storage counts files, snapshots and S3 objects. A limit of 0 means
+        unlimited.
+      x-ogm-cli: ogm quota show
+      responses:
+        "200":
+          description: Limits and usage.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/QuotaStatus"}
+              example:
+                project: research
+                limits: {cpu: 32, memory_mb: 131072, gpus: 4, instances: 10, storage_mb: 512000}
+                usage: {cpu: 12, memory_mb: 49152, gpus: 2, instances: 3, storage_bytes: 21474836480}
+                update_time: "2026-11-01T09:00:00Z"
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    put:
+      operationId: setProjectQuota
+      tags: [Projects]
+      summary: Set a project's quota
+      description: |
+        **Admin only.** Replaces the project's limits (all fields; omitted ones become 0 =
+        unlimited). Existing workloads keep running; changes that would exceed the quota are
+        then refused with `403 quota exceeded` (group create/update/scale, schedules that
+        scale, file and S3 uploads past `storage_mb`). Use project `*` to set the default
+        quota for every project without its own.
+      x-ogm-cli: ogm quota set --cpu N --memory-mb N --gpus N --instances N --storage-mb N
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/Quota"}
+            example: {cpu: 32, memory_mb: 131072, gpus: 4, instances: 10, storage_mb: 512000}
+      responses:
+        "200":
+          description: The new limits and current usage.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/QuotaStatus"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  # ------------------------------------------------------------------ Container groups
+  /v1/projects/{project}/containers:
+    parameters:
+      - {$ref: "#/components/parameters/Project"}
+    get:
+      operationId: listContainerGroups
+      tags: [Container groups]
+      summary: List container groups
+      description: All container groups in the project, with live state (instances not included).
+      x-ogm-cli: ogm ls
+      responses:
+        "200":
+          description: Container groups.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ContainerGroupList"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    post:
+      operationId: createContainerGroup
+      tags: [Container groups]
+      summary: Create a container group
+      description: |
+        Creates a group from a full spec. Fails with `409` if a group of that name exists; use
+        `PUT /containers/{group}` for create-or-update. Defaults are filled in (priority
+        `medium`, restart `always`, 1 vCPU, 1024 MB, 10 GB storage, …) and the response shows the
+        normalized spec. With `autostart_policy: false` the group is created `stopped`.
+
+        A `queue_connection.queue_name` must name an existing queue in the project. If the
+        project has a quota and the group's peak footprint would exceed it, the request fails
+        with `403 quota exceeded` (details in `errors.quota`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ContainerGroupSpec"}
+            examples:
+              gpuEndpoint:
+                summary: GPU inference endpoint behind the gateway
+                value:
+                  name: llama
+                  replicas: 2
+                  container:
+                    image: vllm/vllm-openai:v0.6.3
+                    command: [--model, meta-llama/Llama-3.1-8B-Instruct]
+                    env: {HF_TOKEN: "{{secret:HF_TOKEN}}"}
+                    resources: {cpu: 4, memory_mb: 16384, gpu_count: 1, min_vram_mb: 20000, shm_mb: 2048}
+                  networking: {port: 8000, auth: true, max_concurrency: 16}
+                  startup_probe: {http: {path: /health, port: 8000}, period_seconds: 10, failure_threshold: 120}
+                  readiness_probe: {http: {path: /health, port: 8000}}
+              queueWorker:
+                summary: Queue worker autoscaled on queue depth
+                value:
+                  name: sdxl-worker
+                  replicas: 0
+                  priority: batch
+                  container:
+                    image: registry.ogm/default/sdxl:1.2
+                    resources: {gpu_classes: [rtx-4090, rtx-3090]}
+                  queue_connection: {queue_name: sdxl, port: 8080, path: /generate, concurrency: 1}
+                  queue_autoscaler: {min_replicas: 0, max_replicas: 10, desired_queue_length: 5}
+              serverless:
+                summary: Scale-to-zero HTTP service
+                value:
+                  name: whisper
+                  replicas: 0
+                  container:
+                    image: ghcr.io/example/whisper:latest
+                    resources: {gpu_count: 1}
+                  networking: {port: 9000, auth: true}
+                  http_autoscaler: {min_replicas: 0, max_replicas: 4, target_concurrency: 4, scale_down_delay_seconds: 600}
+      responses:
+        "201":
+          description: The created group.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ContainerGroup"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /v1/projects/{project}/containers/{group}:
+    parameters:
+      - {$ref: "#/components/parameters/Project"}
+      - {$ref: "#/components/parameters/Group"}
+    get:
+      operationId: getContainerGroup
+      tags: [Container groups]
+      summary: Get a container group
+      description: |
+        The group's spec, live state, gateway URL/token and its live instances (`instances`).
+        `container.registry_auth.password` is always masked as `********`.
+      x-ogm-cli: ogm get GROUP
+      responses:
+        "200":
+          description: The group, with instances.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ContainerGroup"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    put:
+      operationId: putContainerGroup
+      tags: [Container groups]
+      summary: Create or replace a container group
+      description: |
+        Declarative upsert, used by `ogm deploy`. Creates the group (`201`) or replaces its whole
+        spec (`200`). The `name` in the body is ignored; the URL wins.
+
+        Changes to the container, probes, restart policy or ports bump `version` and trigger a
+        **rolling** replacement (at most `max(1, 25%)` at a time, each new instance must be ready
+        before an old one stops). Other changes (replicas, networking settings, autoscalers,
+        queue connection) apply live. Sending back the masked registry password `********`
+        keeps the stored one. Exceeding the project quota fails with `403 quota exceeded`.
+      x-ogm-cli: ogm deploy -f app.yaml
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ContainerGroupSpec"}
+            example:
+              replicas: 1
+              container:
+                image: ghcr.io/old-stock/ogm-demo:latest
+                resources: {cpu: 2, memory_mb: 4096, gpu_count: 1}
+              networking: {port: 8080, auth: true}
+      responses:
+        "200":
+          description: Updated.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ContainerGroup"}
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ContainerGroup"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    patch:
+      operationId: patchContainerGroup
+      tags: [Container groups]
+      summary: Update a container group (merge patch)
+      description: |
+        Applies an [RFC 7386](https://www.rfc-editor.org/rfc/rfc7386) JSON merge patch to the
+        stored spec, then validates and applies it like `PUT`. Objects merge recursively; `null`
+        removes a field; arrays replace.
+
+        Examples: `{"replicas": 5}` (scale), `{"networking": {"single_connection_limit": true}}`,
+        `{"http_autoscaler": null}` (turn autoscaling off).
+      x-ogm-cli: ogm scale GROUP N
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              type: object
+              description: A partial ContainerGroupSpec; `null` deletes a field.
+              additionalProperties: true
+            examples:
+              scale: {summary: Scale to 5 replicas, value: {replicas: 5}}
+              removeAutoscaler: {summary: Remove the HTTP autoscaler, value: {http_autoscaler: null}}
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: The updated group.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ContainerGroup"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    delete:
+      operationId: deleteContainerGroup
+      tags: [Container groups]
+      summary: Delete a container group
+      description: |
+        Stops all instances (10 s grace) and deletes the group. Persistent volumes are kept;
+        delete them with `DELETE /volumes/{group}`.
+      x-ogm-cli: ogm rm GROUP
+      responses:
+        "204": {description: "Deleted."}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /v1/projects/{project}/containers/{group}/rotate-gateway-token:
+    post:
+      operationId: rotateGatewayToken
+      tags: [Container groups, Gateway]
+      summary: Rotate the gateway share token
+      description: |
+        Issues a new `gateway_token` (`ogmg_…`) for the group and revokes the old one
+        immediately. The share token lets callers without an account use this one group's
+        gateway (when `networking.auth` is on); it never works for the management API.
+      x-ogm-cli: ogm url GROUP --rotate
+      parameters:
+        - {$ref: "#/components/parameters/Project"}
+        - {$ref: "#/components/parameters/Group"}
+      responses:
+        "200":
+          description: The group, with the new `gateway_token`.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ContainerGroup"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /v1/projects/{project}/containers/{group}/start:
+    post:
+      operationId: startContainerGroup
+      tags: [Container groups]
+      summary: Start a container group
+      description: |
+        Starts a `stopped`, `succeeded` or `failed` group: status becomes `deploying`, desired
+        replicas reset to the spec (clamped to the autoscaler range). A no-op for a running
+        group. Placement is asynchronous; poll the group or its events.
+      x-ogm-cli: ogm start GROUP
+      parameters:
+        - {$ref: "#/components/parameters/Project"}
+        - {$ref: "#/components/parameters/Group"}
+      responses:
+        "202":
+          description: Accepted; the group as it is now.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ContainerGroup"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /v1/projects/{project}/containers/{group}/stop:
+    post:
+      operationId: stopContainerGroup
+      tags: [Container groups]
+      summary: Stop a container group
+      description: |
+        Sets the group to `stopped`; the reconciler stops its instances (they get a termination
+        notice first). The spec, gateway token and volumes are kept. Idempotent.
+      x-ogm-cli: ogm stop GROUP
+      parameters:
+        - {$ref: "#/components/parameters/Project"}
+        - {$ref: "#/components/parameters/Group"}
+      responses:
+        "202":
+          description: Accepted; the group as it is now.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ContainerGroup"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  # ------------------------------------------------------------------ Instances
+  /v1/projects/{project}/containers/{group}/instances:
+    get:
+      operationId: listInstances
+      tags: [Instances]
+      summary: List a group's instances
+      description: Live (non-terminated) instances of the group. Add `all=1` to include terminated ones.
+      x-ogm-cli: ogm ps GROUP
+      parameters:
+        - {$ref: "#/components/parameters/Project"}
+        - {$ref: "#/components/parameters/Group"}
+        - name: all
+          in: query
+          description: "`1` to include terminated instances."
+          schema: {type: string, enum: ["1"]}
+      responses:
+        "200":
+          description: Instances.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/InstanceList"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /v1/projects/{project}/containers/{group}/instances/{instance}:
+    parameters:
+      - {$ref: "#/components/parameters/Project"}
+      - {$ref: "#/components/parameters/Group"}
+      - {$ref: "#/components/parameters/Instance"}
+    get:
+      operationId: getInstance
+      tags: [Instances]
+      summary: Get an instance
+      description: One instance with its node, GPU, state and live metrics.
+      responses:
+        "200":
+          description: The instance.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Instance"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    patch:
+      operationId: updateInstance
+      tags: [Instances]
+      summary: Set an instance's deletion cost
+      description: |
+        Instances with a higher `deletion_cost` are removed last when the group scales down.
+        Raise it while an instance is busy. (Containers can do the same through IMDS:
+        `PUT $OGM_IMDS_URL/v1/deletion-cost`.)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                deletion_cost: {type: integer}
+            example: {deletion_cost: 100}
+      responses:
+        "200":
+          description: The instance.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Instance"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /v1/projects/{project}/containers/{group}/instances/{instance}/{action}:
+    post:
+      operationId: instanceAction
+      tags: [Instances]
+      summary: Restart, recreate or reallocate an instance
+      description: |
+        - `restart`: restart the container in place.
+        - `recreate`: remove the container and create it fresh (re-pulling per the pull policy).
+        - `reallocate`: stop the instance and place it on a **different** node; the current node
+          is banned for this group for 30 minutes.
+
+        Returns `409` if the instance is not placed on a node (allocating or terminated).
+      x-ogm-cli: ogm restart|recreate|reallocate GROUP INSTANCE
+      parameters:
+        - {$ref: "#/components/parameters/Project"}
+        - {$ref: "#/components/parameters/Group"}
+        - {$ref: "#/components/parameters/Instance"}
+        - name: action
+          in: path
+          required: true
+          schema: {type: string, enum: [restart, recreate, reallocate]}
+      responses:
+        "202": {description: "Accepted; the node carries it out asynchronously."}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+  # ------------------------------------------------------------------ Logs & events
+  /v1/projects/{project}/containers/{group}/events:
+    get:
+      operationId: listGroupEvents
+      tags: [Logs & events]
+      summary: List a group's events
+      description: |
+        Lifecycle events of the group and its instances, newest first: created, started,
+        updated (with version), replica changes, placements, pulls, readiness, exits,
+        preemptions, reallocations.
+      x-ogm-cli: ogm events GROUP
+      parameters:
+        - {$ref: "#/components/parameters/Project"}
+        - {$ref: "#/components/parameters/Group"}
+        - {$ref: "#/components/parameters/EventLimit"}
+      responses:
+        "200":
+          description: Events, newest first.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/EventList"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /v1/projects/{project}/containers/{group}/logs:
+    get:
+      operationId: getGroupLogs
+      tags: [Logs & events]
+      summary: Read or follow a group's logs
+      description: |
+        Container stdout/stderr of all the group's instances, oldest first (the **last**
+        `limit` matching lines).
+
+        With `follow=1` the response is a `text/event-stream` (Server-Sent Events): first the
+        matching backlog, then live lines, one `data: {LogEntry JSON}` event per line, and a
+        `: ping` comment every 15 s. Filters (`instance`, `q`) apply to live lines too.
+
+        ```sh
+        curl -N -H "Authorization: Bearer $KEY" "$OGM/v1/projects/default/containers/llama/logs?since=10m&follow=1"
+        ```
+      x-ogm-cli: ogm logs GROUP [-f] [--instance ID] [--since 10m] [-q TEXT]
+      parameters:
+        - {$ref: "#/components/parameters/Project"}
+        - {$ref: "#/components/parameters/Group"}
+        - name: since
+          in: query
+          description: Only lines newer than this. A Go duration (`10m`, `2h`) or an RFC 3339 time.
+          schema: {type: string}
+          example: 10m
+        - name: instance
+          in: query
+          description: Only this instance's lines.
+          schema: {type: string}
+        - name: q
+          in: query
+          description: Substring filter (case-sensitive `LIKE`).
+          schema: {type: string}
+        - name: limit
+          in: query
+          description: Maximum backlog lines (max 10000).
+          schema: {type: integer, default: 500, maximum: 10000}
+        - name: follow
+          in: query
+          description: "`1` to stream as Server-Sent Events."
+          schema: {type: string, enum: ["1"]}
+      responses:
+        "200":
+          description: Log lines (JSON), or an SSE stream with `follow=1`.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/LogEntryList"}
+            text/event-stream:
+              schema:
+                type: string
+                description: "`data: {LogEntry}` events."
+              example: |
+                data: {"id":881,"instance_id":"inst_9x2","stream":"stdout","line":"INFO: Uvicorn running on :8000","time":"2026-11-03T10:00:01Z"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /v1/projects/{project}/events:
+    get:
+      operationId: listProjectEvents
+      tags: [Logs & events]
+      summary: List a project's events
+      description: Events of every group in the project plus project-level events (secrets, keys, volumes, schedules), newest first.
+      parameters:
+        - {$ref: "#/components/parameters/Project"}
+        - {$ref: "#/components/parameters/EventLimit"}
+      responses:
+        "200":
+          description: Events, newest first.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/EventList"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /v1/events:
+    get:
+      operationId: listClusterEvents
+      tags: [Logs & events]
+      summary: List all cluster events
+      description: "**Admin only.** Every event in the cluster (nodes joining, assessments, all projects), newest first."
+      parameters:
+        - {$ref: "#/components/parameters/EventLimit"}
+      responses:
+        "200":
+          description: Events, newest first.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/EventList"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+  # ------------------------------------------------------------------ Queues & jobs
+  /v1/projects/{project}/queues:
+    parameters:
+      - {$ref: "#/components/parameters/Project"}
+    get:
+      operationId: listQueues
+      tags: [Queues & jobs]
+      summary: List queues
+      description: Queues in the project with job counts by status and the groups attached to each.
+      x-ogm-cli: ogm queue ls
+      responses:
+        "200":
+          description: Queues.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/QueueList"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    post:
+      operationId: createQueue
+      tags: [Queues & jobs]
+      summary: Create a queue
+      description: |
+        Creates a job queue. Attach workers by setting `queue_connection.queue_name` on a
+        container group. All `settings` are optional; omitted ones take the defaults shown in
+        the schema (the response shows effective values).
+      x-ogm-cli: ogm queue create NAME [--max-attempts N] [--timeout S]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: {$ref: "#/components/schemas/Name"}
+                display_name: {type: string, description: "Defaults to `name`."}
+                description: {type: string}
+                settings: {$ref: "#/components/schemas/QueueSettings"}
+            example: {name: sdxl, description: "Image generation jobs", settings: {max_attempts: 5, job_timeout_s: 600}}
+      responses:
+        "201":
+          description: The queue.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Queue"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /v1/projects/{project}/queues/{queue}:
+    parameters:
+      - {$ref: "#/components/parameters/Project"}
+      - {$ref: "#/components/parameters/Queue"}
+    get:
+      operationId: getQueue
+      tags: [Queues & jobs]
+      summary: Get a queue
+      description: The queue, its effective settings, job counts by status and attached groups.
+      x-ogm-cli: ogm queue get NAME
+      responses:
+        "200":
+          description: The queue.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Queue"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    patch:
+      operationId: updateQueue
+      tags: [Queues & jobs]
+      summary: Update a queue
+      description: Updates `display_name`, `description` and/or `settings`. `settings` replaces the whole settings object.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                display_name: {type: string}
+                description: {type: string}
+                settings: {$ref: "#/components/schemas/QueueSettings"}
+            example: {settings: {max_attempts: 3, job_timeout_s: 1800, retry_on_4xx: false}}
+      responses:
+        "200":
+          description: The updated queue.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Queue"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    delete:
+      operationId: deleteQueue
+      tags: [Queues & jobs]
+      summary: Delete a queue
+      description: |
+        Deletes the queue and all its jobs. Refused with `409 queue in use` while container
+        groups are attached, unless `force=1`, which also removes those groups'
+        `queue_connection` and `queue_autoscaler`.
+      x-ogm-cli: ogm queue rm NAME [--force]
+      parameters:
+        - name: force
+          in: query
+          description: "`1` to detach attached groups and delete anyway."
+          schema: {type: string, enum: ["1"]}
+      responses:
+        "204": {description: "Deleted."}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /v1/projects/{project}/queues/{queue}/jobs:
+    parameters:
+      - {$ref: "#/components/parameters/Project"}
+      - {$ref: "#/components/parameters/Queue"}
+    get:
+      operationId: listJobs
+      tags: [Queues & jobs]
+      summary: List jobs
+      description: Jobs in the queue, newest first by default. Finished jobs are kept for the queue's `retention_hours`.
+      x-ogm-cli: ogm job ls QUEUE [--status S]
+      parameters:
+        - name: status
+          in: query
+          schema: {type: string, enum: [pending, running, succeeded, failed, cancelled]}
+        - name: limit
+          in: query
+          schema: {type: integer, default: 100, maximum: 1000}
+        - name: order
+          in: query
+          description: "`asc` for oldest first (submission order)."
+          schema: {type: string, enum: [asc, desc], default: desc}
+      responses:
+        "200":
+          description: Jobs.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/JobList"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    post:
+      operationId: submitJobs
+      tags: [Queues & jobs]
+      summary: Submit a job (or a batch)
+      description: |
+        Submits one job (a `JobPrototype`) or up to 10000 at once as `{"jobs": [...]}`. A single
+        job returns the `Job`; a batch returns `{"items": [Job, ...]}` in order.
+
+        Jobs are delivered to a ready instance of an attached group as
+        `POST http://127.0.0.1:{port}{path}` with the `input` JSON as body and headers
+        `OGM-Job-Id` and `OGM-Job-Attempt`. A 2xx response succeeds the job (`output` = the
+        response JSON, or `{"text": "..."}`); 408/429/5xx/timeouts/crashes retry with backoff;
+        other 4xx fail immediately unless the queue has `retry_on_4xx`.
+
+        If `webhook` is set, the hub POSTs a signed `queue.job.succeeded` / `queue.job.failed`
+        / `queue.job.cancelled` event there when the job finishes (verify with the key from
+        `GET /v1/webhook-secret`).
+      x-ogm-cli: ogm job submit QUEUE [--input JSON | --file F | --batch F.jsonl] [--wait]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              anyOf:
+                - $ref: "#/components/schemas/JobPrototype"
+                - type: object
+                  title: Batch
+                  required: [jobs]
+                  properties:
+                    jobs:
+                      type: array
+                      minItems: 1
+                      maxItems: 10000
+                      items: {$ref: "#/components/schemas/JobPrototype"}
+            examples:
+              single:
+                summary: One job
+                value: {input: {prompt: "a lighthouse at dusk", steps: 30}, metadata: {user: "42"}, webhook: "https://example.com/hooks/ogm"}
+              batch:
+                summary: A batch
+                value: {jobs: [{input: {prompt: cat}}, {input: {prompt: dog}}]}
+      responses:
+        "201":
+          description: "The job, or `{\"items\": [...]}` for a batch."
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: "#/components/schemas/Job"
+                  - $ref: "#/components/schemas/JobList"
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /v1/projects/{project}/queues/{queue}/jobs/{job}:
+    parameters:
+      - {$ref: "#/components/parameters/Project"}
+      - {$ref: "#/components/parameters/Queue"}
+      - name: job
+        in: path
+        required: true
+        description: "Job ID (`job_…`)."
+        schema: {type: string}
+    get:
+      operationId: getJob
+      tags: [Queues & jobs]
+      summary: Get a job (optionally wait for it)
+      description: |
+        The job with its status, output, error, attempts and event history. With `wait=N`
+        the request long-polls up to N seconds (max 60) until the job is `succeeded`, `failed`
+        or `cancelled`, then returns it; if it is still running when the wait elapses you get
+        its current state.
+      x-ogm-cli: ogm job get QUEUE ID [--wait]
+      parameters:
+        - name: wait
+          in: query
+          description: Seconds to long-poll for a terminal state (integer, max 60).
+          schema: {type: integer, minimum: 0, maximum: 60}
+          example: 30
+      responses:
+        "200":
+          description: The job.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Job"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    delete:
+      operationId: cancelJob
+      tags: [Queues & jobs]
+      summary: Cancel a job
+      description: |
+        Cancels a pending or running job. A running job's request to the container is
+        cancelled (your server sees the client disconnect). `409` if the job already finished.
+      x-ogm-cli: ogm job cancel QUEUE ID
+      responses:
+        "202": {description: "Cancelled."}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /v1/webhook-secret:
+    get:
+      operationId: getWebhookSecret
+      tags: [Queues & jobs]
+      summary: Get the webhook signing key
+      description: |
+        The base64 key that signs job webhooks ([Standard Webhooks](https://www.standardwebhooks.com/):
+        headers `webhook-id`, `webhook-timestamp`, `webhook-signature: v1,<base64 HMAC-SHA256(id.timestamp.body)>`).
+        Any svix-compatible library verifies them. Failed deliveries retry after 5 s, 30 s, 2 min, 10 min and 1 h.
+        Each project has its own key, so members of one project cannot forge another project's webhooks.
+      parameters:
+        - name: project
+          in: query
+          description: Project whose key to return. Default `default`, or the project a scoped key is bound to.
+          schema: {type: string}
+      responses:
+        "200":
+          description: The key.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/WebhookSecret"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+    post:
+      operationId: rotateWebhookSecret
+      tags: [Queues & jobs]
+      summary: Rotate the webhook signing key
+      description: "**Admin only.** Generates a new webhook signing key; deliveries from now on use it."
+      responses:
+        "200":
+          description: The new key.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/WebhookSecret"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+  # ------------------------------------------------------------------ Schedules
+  /v1/projects/{project}/schedules:
+    parameters:
+      - {$ref: "#/components/parameters/Project"}
+    get:
+      operationId: listSchedules
+      tags: [Schedules]
+      summary: List schedules
+      description: Schedules in the project, by name, with next/last run and last status.
+      x-ogm-cli: ogm schedule ls
+      responses:
+        "200":
+          description: Schedules.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ScheduleList"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    post:
+      operationId: createSchedule
+      tags: [Schedules]
+      summary: Create a schedule
+      description: |
+        Creates a schedule; `409` if the name exists (use `PUT` to upsert). Exactly one action
+        is required: `job` (submit to a queue), `http` (call a group through the gateway,
+        internal, no auth needed) or `scale` (set a group's replicas).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ScheduleSpec"}
+            examples:
+              job:
+                summary: Nightly job
+                value: {name: nightly-report, schedule: "0 3 * * *", job: {queue: reports, input: {kind: daily}}}
+              scale:
+                summary: Scale down at night
+                value: {name: night-scale, schedule: "0 22 * * 1-5", scale: {group: llama, replicas: 0}}
+              http:
+                summary: Ping an endpoint every 5 minutes
+                value: {name: warmup, schedule: "*/5 * * * *", http: {group: llama, method: GET, path: /health}}
+      responses:
+        "201":
+          description: The schedule.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Schedule"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /v1/projects/{project}/schedules/{name}:
+    parameters:
+      - {$ref: "#/components/parameters/Project"}
+      - name: name
+        in: path
+        required: true
+        description: Schedule name.
+        schema: {type: string}
+    put:
+      operationId: putSchedule
+      tags: [Schedules]
+      summary: Create or replace a schedule
+      description: |
+        Upsert. `name` in the body may be omitted; if present it must match the URL. Run
+        history (`runs`, `last_run_time`) is kept on update.
+      x-ogm-cli: ogm schedule create NAME --cron "*/5 * * * *" (--queue Q | --http GROUP | --scale GROUP --replicas N)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ScheduleSpec"}
+            example: {schedule: "0 8 * * 1-5", scale: {group: llama, replicas: 3}, comment: "office hours"}
+      responses:
+        "200":
+          description: The schedule.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Schedule"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    get:
+      operationId: getSchedule
+      tags: [Schedules]
+      summary: Get a schedule
+      x-ogm-cli: ogm schedule get NAME
+      description: The schedule with its next run time and last result.
+      responses:
+        "200":
+          description: The schedule.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Schedule"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    delete:
+      operationId: deleteSchedule
+      tags: [Schedules]
+      summary: Delete a schedule
+      description: Deletes the schedule. Already-submitted jobs are not affected.
+      x-ogm-cli: ogm schedule rm NAME
+      responses:
+        "204": {description: "Deleted."}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /v1/projects/{project}/schedules/{name}/run:
+    post:
+      operationId: runSchedule
+      tags: [Schedules]
+      summary: Run a schedule now
+      description: |
+        Fires the schedule's action immediately (even if disabled) and returns its result,
+        e.g. `ok: job job_…`, `ok: llama replicas = 0` or `error: queue reports not found`.
+        Counts as a run in `runs` / `last_status`.
+      x-ogm-cli: ogm schedule run NAME
+      parameters:
+        - {$ref: "#/components/parameters/Project"}
+        - name: name
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: The run result.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: {type: string, description: "`ok: …` or `error: …`."}
+              example: {status: "ok: job job_7f3a9c"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  # ------------------------------------------------------------------ Secrets
+  /v1/projects/{project}/secrets:
+    get:
+      operationId: listSecrets
+      tags: [Secrets]
+      summary: List secrets
+      description: Secret names and dates, by name. Values are never returned.
+      x-ogm-cli: ogm secret ls
+      parameters:
+        - {$ref: "#/components/parameters/Project"}
+      responses:
+        "200":
+          description: Secrets (names only).
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SecretList"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /v1/projects/{project}/secrets/{name}:
+    parameters:
+      - {$ref: "#/components/parameters/Project"}
+      - name: name
+        in: path
+        required: true
+        description: "Secret name: letters, digits, `_ . -`, max 128."
+        schema: {type: string, pattern: "^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$"}
+    put:
+      operationId: putSecret
+      tags: [Secrets]
+      summary: Set a secret
+      description: |
+        Creates or overwrites a secret (up to 64 KiB), encrypted at rest with the hub's
+        `secrets.key`. Reference it from container env as `{{secret:NAME}}`; it is expanded when
+        an instance is placed. Instances waiting for a missing secret are placed once it is set.
+        Running instances keep the old value until recreated.
+      x-ogm-cli: ogm secret set NAME [VALUE | --from-file F]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [value]
+              properties:
+                value: {type: string, maxLength: 65536}
+            example: {value: hf_xxxxxxxxxxxxxxxxxxxxxxxx}
+      responses:
+        "200":
+          description: Stored (the value is not echoed).
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Secret"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    delete:
+      operationId: deleteSecret
+      tags: [Secrets]
+      summary: Delete a secret
+      description: Deletes the secret. Groups that reference it can't place new instances until it is set again.
+      x-ogm-cli: ogm secret rm NAME
+      responses:
+        "204": {description: "Deleted."}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  # ------------------------------------------------------------------ Volumes & snapshots
+  /v1/projects/{project}/volumes:
+    get:
+      operationId: listVolumes
+      tags: [Volumes & snapshots]
+      summary: List persistent volumes
+      description: |
+        One entry per group replica that has volumes: the node holding them and whether a live
+        instance is using them. Entries remain after the group is deleted, until you delete
+        them.
+      x-ogm-cli: ogm volumes
+      parameters:
+        - {$ref: "#/components/parameters/Project"}
+      responses:
+        "200":
+          description: Volume sets.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/VolumeInfoList"}
+              example:
+                items:
+                  - {group: postgres, replica: 0, node_id: node_4kq2, node_name: alice-desktop, volumes: [data], in_use: true}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /v1/projects/{project}/volumes/{group}:
+    delete:
+      operationId: deleteVolumes
+      tags: [Volumes & snapshots]
+      summary: Delete a group's volumes
+      description: |
+        Forgets the volume pins of the group (or one `replica`) and tells the holding nodes to
+        delete the data. **Irreversible.** Refused with `409` while a replica is running
+        (stop or scale down first) or while the holding node is offline. `404` if there is
+        nothing to delete.
+      x-ogm-cli: ogm volumes rm GROUP [--replica N]
+      parameters:
+        - {$ref: "#/components/parameters/Project"}
+        - {$ref: "#/components/parameters/Group"}
+        - name: replica
+          in: query
+          description: Only this replica index (default all).
+          schema: {type: integer, minimum: 0}
+      responses:
+        "204": {description: "Deleted."}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /v1/projects/{project}/volumes/{group}/snapshots:
+    post:
+      operationId: createSnapshot
+      tags: [Volumes & snapshots]
+      summary: Snapshot a replica's volumes
+      description: |
+        Asynchronously streams the replica's volumes from the holding node into the hub as a
+        `.tar.gz`. Returns `202` with the snapshot in status `pending`; poll
+        `GET /snapshots/{id}` until `ready` or `failed`. The group must still exist (its image is
+        used to read the volume) and the holding node must be online. Snapshotting a running
+        replica works but is only crash-consistent.
+      x-ogm-cli: ogm snapshot create GROUP [--replica N]
+      parameters:
+        - {$ref: "#/components/parameters/Project"}
+        - {$ref: "#/components/parameters/Group"}
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                replica: {type: integer, minimum: 0, default: 0}
+                name: {type: string, description: "Optional label."}
+            example: {replica: 0, name: before-upgrade}
+      responses:
+        "202":
+          description: Snapshot started.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Snapshot"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /v1/projects/{project}/snapshots:
+    get:
+      operationId: listSnapshots
+      tags: [Volumes & snapshots]
+      summary: List snapshots
+      description: Snapshots in the project, newest first.
+      x-ogm-cli: ogm snapshot ls
+      parameters:
+        - {$ref: "#/components/parameters/Project"}
+        - name: group
+          in: query
+          description: Only snapshots of this group.
+          schema: {type: string}
+      responses:
+        "200":
+          description: Snapshots.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SnapshotList"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /v1/projects/{project}/snapshots/{id}:
+    parameters:
+      - {$ref: "#/components/parameters/Project"}
+      - {$ref: "#/components/parameters/SnapshotID"}
+    get:
+      operationId: getSnapshot
+      tags: [Volumes & snapshots]
+      summary: Get a snapshot
+      description: The snapshot's status (`pending`, `ready`, `failed`), size, and `restore_status` of the last restore.
+      responses:
+        "200":
+          description: The snapshot.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Snapshot"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    delete:
+      operationId: deleteSnapshot
+      tags: [Volumes & snapshots]
+      summary: Delete a snapshot
+      description: Deletes the snapshot and its archive from the hub.
+      x-ogm-cli: ogm snapshot rm ID
+      responses:
+        "204": {description: "Deleted."}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /v1/projects/{project}/snapshots/{id}/restore:
+    post:
+      operationId: restoreSnapshot
+      tags: [Volumes & snapshots]
+      summary: Restore a snapshot
+      description: |
+        Restores a `ready` snapshot into a group replica's volumes, **overwriting** them, on the
+        replica's pinned node, the snapshot's node, or the `node` you name. Restoring onto a
+        different node re-pins the replica there (old data on the previous node is removed):
+        this is how volumes migrate between nodes.
+
+        Volumes are matched by name, so the target group must declare them in
+        `container.volumes`, and the target replica must not be running (deploy the group
+        stopped, restore, then start). Asynchronous: poll the snapshot's `restore_status`
+        (`restoring` → `restored` / `failed: …`).
+      x-ogm-cli: ogm snapshot restore ID [--node NODE]
+      parameters:
+        - {$ref: "#/components/parameters/Project"}
+        - {$ref: "#/components/parameters/SnapshotID"}
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                group: {type: string, description: "Target group (default: the snapshot's group)."}
+                replica: {type: integer, minimum: 0, description: "Target replica (default: the snapshot's replica)."}
+                node: {type: string, description: "Target node ID or name (default: the replica's pinned node, else the snapshot's node)."}
+            example: {node: bob-workstation}
+      responses:
+        "202":
+          description: Restore started.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  snapshot: {type: string}
+                  group: {type: string}
+                  replica: {type: integer}
+                  node_id: {type: string}
+                  status: {type: string, const: restoring}
+              example: {snapshot: snap_5d1e8a, group: postgres, replica: 0, node_id: node_8bb1, status: restoring}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+  # ------------------------------------------------------------------ KV store
+  /v1/projects/{project}/kv:
+    get:
+      operationId: listKVTables
+      tags: [KV store]
+      summary: List KV tables
+      description: Tables in the project with their live key count and total value bytes. Tables exist implicitly while they hold keys.
+      x-ogm-cli: ogm kv tables
+      parameters:
+        - {$ref: "#/components/parameters/Project"}
+      responses:
+        "200":
+          description: Tables.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/KVTableList"}
+              example: {items: [{name: sessions, keys: 1204, bytes: 88412}]}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /v1/projects/{project}/kv/{table}:
+    parameters:
+      - {$ref: "#/components/parameters/Project"}
+      - {$ref: "#/components/parameters/KVTable"}
+    get:
+      operationId: listKVKeys
+      tags: [KV store]
+      summary: List keys in a table
+      description: |
+        Keys in lexical order, paginated: pass the returned `next_after` as `after` to get the
+        next page (empty when done). Values are omitted unless `values=1` (then returned as
+        strings).
+      x-ogm-cli: ogm kv ls TABLE
+      parameters:
+        - name: prefix
+          in: query
+          description: Only keys starting with this.
+          schema: {type: string}
+        - name: after
+          in: query
+          description: Start after this key (exclusive).
+          schema: {type: string}
+        - name: limit
+          in: query
+          schema: {type: integer, default: 100, minimum: 1, maximum: 1000}
+        - name: values
+          in: query
+          description: "`1` to include values."
+          schema: {type: string, enum: ["1"]}
+      responses:
+        "200":
+          description: A page of keys.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/KVKeyPage"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    delete:
+      operationId: dropKVTable
+      tags: [KV store]
+      summary: Delete a whole table
+      description: Deletes every key in the table and returns how many were deleted.
+      x-ogm-cli: ogm kv drop TABLE
+      responses:
+        "200":
+          description: Deleted count.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted: {type: integer}
+              example: {deleted: 1204}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /v1/projects/{project}/kv/{table}/{key}:
+    parameters:
+      - {$ref: "#/components/parameters/Project"}
+      - {$ref: "#/components/parameters/KVTable"}
+      - {$ref: "#/components/parameters/KVKey"}
+    get:
+      operationId: getKVValue
+      tags: [KV store]
+      summary: Get a value
+      description: |
+        Returns the raw value bytes with the `Content-Type` it was stored with
+        (`application/octet-stream` if none). The version is in `ETag` (`"3"`) and
+        `OGM-Version`; the expiry, if any, in `OGM-Expires`. Send `If-None-Match: "3"` to get
+        `304` when unchanged.
+      x-ogm-cli: ogm kv get TABLE KEY
+      parameters:
+        - name: If-None-Match
+          in: header
+          description: A previously returned ETag.
+          schema: {type: string}
+      responses:
+        "200":
+          description: The value.
+          headers:
+            ETag: {description: 'Quoted version, e.g. `"3"`.', schema: {type: string}}
+            OGM-Version: {description: "The version number.", schema: {type: integer}}
+            OGM-Expires: {description: "Expiry time (RFC 3339) if the key has a TTL.", schema: {type: string, format: date-time}}
+          content:
+            application/octet-stream:
+              schema: {type: string, format: binary}
+        "304": {description: "Not modified (ETag matched)."}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    put:
+      operationId: putKVValue
+      tags: [KV store]
+      summary: Put a value
+      description: |
+        Stores the request body (up to 1 MiB, any bytes) and its `Content-Type`. Each write
+        increments the key's version.
+
+        - `If-Match: "N"`: compare-and-set; only write if the current version is N (else `412`).
+        - `If-None-Match: *`: create only; `412` if the key exists.
+        - `ttl=SECONDS`: expire the key after that long (each write resets the TTL; omit for none).
+
+        ```sh
+        curl -X PUT -H "Authorization: Bearer $KEY" -H 'If-None-Match: *' \
+          --data-binary '{"owner":"worker-3"}' "$OGM/v1/projects/default/kv/locks/job-42?ttl=60"
+        ```
+      x-ogm-cli: ogm kv put TABLE KEY VALUE [--ttl 10m] [--if-version N]
+      parameters:
+        - name: ttl
+          in: query
+          description: Time to live in seconds.
+          schema: {type: integer, minimum: 1}
+        - name: If-Match
+          in: header
+          description: Write only if the current version equals this (`"N"` or `N`).
+          schema: {type: string}
+        - name: If-None-Match
+          in: header
+          description: "`*` to create only."
+          schema: {type: string, enum: ["*"]}
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: {type: string, format: binary, maxLength: 1048576}
+          application/json:
+            schema: {}
+            example: {owner: worker-3}
+          text/plain:
+            schema: {type: string}
+      responses:
+        "200":
+          description: Stored.
+          headers:
+            ETag: {description: "The new version, quoted.", schema: {type: string}}
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  key: {type: string}
+                  version: {type: integer}
+              example: {key: job-42, version: 1}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "412": {$ref: "#/components/responses/PreconditionFailed"}
+        "413":
+          description: Value larger than 1 MiB.
+          content:
+            application/problem+json:
+              schema: {$ref: "#/components/schemas/Problem"}
+    post:
+      operationId: incrementKVCounter
+      tags: [KV store]
+      summary: Atomically increment a counter
+      description: |
+        Adds `by` (default 1, may be negative) to the integer value of the key, creating it at
+        0 first if missing, and returns the new value. `409` if the current value is not an
+        integer. `ttl` (seconds) sets a new expiry; otherwise an existing one is kept.
+      x-ogm-cli: ogm kv incr TABLE KEY
+      parameters:
+        - name: by
+          in: query
+          schema: {type: integer, default: 1}
+        - name: ttl
+          in: query
+          description: Time to live in seconds.
+          schema: {type: integer, minimum: 1}
+      responses:
+        "200":
+          description: The new value.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  key: {type: string}
+                  value: {type: integer}
+                  version: {type: integer}
+              example: {key: requests, value: 1043, version: 1043}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+    delete:
+      operationId: deleteKVKey
+      tags: [KV store]
+      summary: Delete a key
+      description: 'Deletes the key. With `If-Match: "N"` only if its version is N (`412` otherwise).'
+      x-ogm-cli: ogm kv rm TABLE KEY
+      parameters:
+        - name: If-Match
+          in: header
+          schema: {type: string}
+      responses:
+        "204": {description: "Deleted."}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "412": {$ref: "#/components/responses/PreconditionFailed"}
+  # ------------------------------------------------------------------ Files
+  /v1/projects/{project}/files:
+    get:
+      operationId: listFiles
+      tags: [Files]
+      summary: List files
+      description: Files in the project store, by path. Includes snapshot archives under `.snapshots/`.
+      x-ogm-cli: ogm files ls [PREFIX]
+      parameters:
+        - {$ref: "#/components/parameters/Project"}
+        - name: prefix
+          in: query
+          schema: {type: string}
+        - name: limit
+          in: query
+          schema: {type: integer, default: 1000}
+      responses:
+        "200":
+          description: Files.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/FileInfoList"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /v1/projects/{project}/files/{path}:
+    parameters:
+      - {$ref: "#/components/parameters/Project"}
+      - {$ref: "#/components/parameters/FilePath"}
+    put:
+      operationId: uploadFile
+      tags: [Files]
+      summary: Upload a file
+      description: |
+        Stores the raw request body at `path` (up to 50 GiB), replacing any existing file. The
+        `Content-Type` header is stored (guessed from the extension if absent). Uploads beyond
+        the project's `storage_mb` quota fail with `403 quota exceeded`; over 50 GiB with `413`.
+      x-ogm-cli: ogm files put LOCAL [REMOTE]
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: {type: string, format: binary}
+      responses:
+        "201":
+          description: Stored.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/FileInfo"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    get:
+      operationId: downloadFile
+      tags: [Files]
+      summary: Download a file
+      description: The file's bytes with its stored `Content-Type`. Supports `Range`, `If-Modified-Since` and `HEAD`.
+      x-ogm-cli: ogm files get REMOTE [LOCAL]
+      responses:
+        "200":
+          description: The file.
+          content:
+            application/octet-stream:
+              schema: {type: string, format: binary}
+        "206": {description: "Partial content (Range)."}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    delete:
+      operationId: deleteFile
+      tags: [Files]
+      summary: Delete a file
+      description: Deletes the file. Succeeds even if it doesn't exist.
+      x-ogm-cli: ogm files rm REMOTE
+      responses:
+        "204": {description: "Deleted."}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /v1/projects/{project}/file-tokens/{path}:
+    post:
+      operationId: createFileToken
+      tags: [Files]
+      summary: Create a signed file URL
+      description: |
+        Returns a URL under `/v1/signed/…` that allows one method (`GET` to download — also
+        `HEAD` — or `PUT` to upload) on this one path without a key, until it expires. Share it,
+        or hand it to a browser or a container. The file needn't exist yet for `PUT`.
+      x-ogm-cli: ogm files sign REMOTE [--put]
+      parameters:
+        - {$ref: "#/components/parameters/Project"}
+        - {$ref: "#/components/parameters/FilePath"}
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                method: {type: string, enum: [GET, PUT], default: GET}
+                expires_in_s: {type: integer, default: 3600, minimum: 1, maximum: 604800}
+            example: {method: GET, expires_in_s: 86400}
+      responses:
+        "200":
+          description: The signed URL.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SignedURL"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /v1/signed/{project}/{path}:
+    parameters:
+      - {$ref: "#/components/parameters/Project"}
+      - {$ref: "#/components/parameters/FilePath"}
+      - {name: method, in: query, required: true, description: "The signed method.", schema: {type: string, enum: [GET, PUT]}}
+      - {name: exp, in: query, required: true, description: "Expiry (Unix seconds).", schema: {type: integer}}
+      - {name: sig, in: query, required: true, description: "HMAC-SHA256 signature (hex).", schema: {type: string}}
+    get:
+      operationId: getSignedFile
+      tags: [Files]
+      summary: Download a file with a signed URL
+      description: "**Public** (the signature is the credential). Get one from `POST /file-tokens/{path}`. `403` if the signature is invalid, expired or for another method."
+      security: []
+      responses:
+        "200":
+          description: The file.
+          content:
+            application/octet-stream:
+              schema: {type: string, format: binary}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    put:
+      operationId: putSignedFile
+      tags: [Files]
+      summary: Upload a file with a signed URL
+      description: "**Public** (the signature is the credential). Requires a URL signed for `PUT`."
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: {type: string, format: binary}
+      responses:
+        "201":
+          description: Stored.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/FileInfo"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+  # ------------------------------------------------------------------ S3 credentials
+  /v1/projects/{project}/s3-credentials:
+    parameters:
+      - {$ref: "#/components/parameters/Project"}
+    post:
+      operationId: createS3Credential
+      tags: [S3 credentials]
+      summary: Create an S3 access key
+      description: |
+        Creates an S3 access key pair bound to the project. **The secret is returned only
+        here.** Use it with any S3 client: endpoint `{hub}/s3`, path-style addressing, any region.
+      x-ogm-cli: ogm s3 credentials create [--save]
+      responses:
+        "201":
+          description: The credential, including `secret_access_key`.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/S3Credential"}
+              example:
+                access_key_id: OGMS3EXAMPLEKEYID000
+                secret_access_key: EXAMPLE-secret-access-key-do-not-use
+                endpoint: https://gpu.example.com/s3
+                region: us-east-1
+                project: default
+                user: alice
+                create_time: "2026-11-03T10:00:00Z"
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    get:
+      operationId: listS3Credentials
+      tags: [S3 credentials]
+      summary: List S3 access keys
+      description: Access keys of the project (never secrets), with creator and last use.
+      x-ogm-cli: ogm s3 credentials ls
+      responses:
+        "200":
+          description: Credentials.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/S3CredentialList"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /v1/projects/{project}/s3-credentials/{access_key}:
+    delete:
+      operationId: deleteS3Credential
+      tags: [S3 credentials]
+      summary: Revoke an S3 access key
+      description: Revokes the key immediately.
+      x-ogm-cli: ogm s3 credentials rm ACCESS_KEY
+      parameters:
+        - {$ref: "#/components/parameters/Project"}
+        - name: access_key
+          in: path
+          required: true
+          schema: {type: string, pattern: "^OGMS3[A-Z0-9]{15}$"}
+      responses:
+        "204": {description: "Revoked."}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  # ------------------------------------------------------------------ API keys
+  /v1/keys:
+    post:
+      operationId: createAPIKey
+      tags: [API keys]
+      summary: Create a scoped API key
+      description: |
+        Mints an `ogmk_…` key for you. **The key is returned only here.**
+
+        - `project`: limit the key to one project (you must have access). Omit for all your projects.
+        - `role`: `developer` (default), `viewer` (read-only) or `admin` (only admins may mint it).
+        - `expires_in_hours`: 0 = never (max 43920, five years).
+
+        A scoped key can only mint keys at most as powerful as itself (same project, no
+        escalation to admin). Viewer keys and instance identities cannot manage keys.
+      x-ogm-cli: ogm keys create NAME [--project P] [--role developer|viewer|admin] [--expires 720h]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: {type: string, maxLength: 100}
+                project: {type: string}
+                role: {type: string, enum: [developer, viewer, admin], default: developer}
+                expires_in_hours: {type: integer, minimum: 0, maximum: 43920, default: 0}
+            example: {name: github-actions, project: default, role: developer, expires_in_hours: 720}
+      responses:
+        "201":
+          description: The key, including the secret `key`.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/APIKey"}
+              example:
+                id: key_2m8q
+                name: github-actions
+                project: default
+                role: developer
+                user: alice
+                expire_time: "2026-12-03T10:00:00Z"
+                create_time: "2026-11-03T10:00:00Z"
+                key: ogmk_EXAMPLE_KEY_SHOWN_ONCE
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    get:
+      operationId: listAPIKeys
+      tags: [API keys]
+      summary: List your API keys
+      description: Your scoped keys (no secrets), oldest first. Admins can pass `all=1` to list everyone's.
+      x-ogm-cli: ogm keys ls
+      parameters:
+        - name: all
+          in: query
+          description: "`1` (admins only) to list all users' keys."
+          schema: {type: string, enum: ["1"]}
+      responses:
+        "200":
+          description: Keys.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/APIKeyList"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+  /v1/keys/{id}:
+    delete:
+      operationId: deleteAPIKey
+      tags: [API keys]
+      summary: Revoke an API key
+      description: Revokes one of your keys immediately (admins can revoke anyone's).
+      x-ogm-cli: ogm keys rm ID
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: "Key ID (`key_…`), not the secret."
+          schema: {type: string}
+      responses:
+        "204": {description: "Revoked."}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  # ------------------------------------------------------------------ Nodes & assessment
+  /v1/nodes:
+    get:
+      operationId: listNodes
+      tags: [Nodes & assessment]
+      summary: List nodes
+      description: All contributor machines with their GPUs, status, uptime ratio, instance count and latest assessment.
+      x-ogm-cli: ogm nodes
+      responses:
+        "200":
+          description: Nodes.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/NodeList"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+    post:
+      operationId: createNode
+      tags: [Nodes & assessment]
+      summary: Create a node join token
+      description: |
+        Registers a node owned by you (status `pending` until the agent connects) and returns
+        its token (`ogmn_…`, shown once) and the one-line installer command to run on the
+        machine. `name` defaults to `{you}-{random}`.
+      x-ogm-cli: ogm node add NAME
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: {type: string}
+            example: {name: alice-desktop}
+      responses:
+        "201":
+          description: The token and install command.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/NodeToken"}
+              example:
+                node_id: node_4kq2
+                name: alice-desktop
+                token: ogmn_EXAMPLE_NODE_TOKEN
+                install_command: curl -fsSL https://gpu.example.com/install.sh | sh -s -- --token ogmn_EXAMPLE_NODE_TOKEN
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /v1/nodes/{node}:
+    parameters:
+      - {$ref: "#/components/parameters/Node"}
+    get:
+      operationId: getNode
+      tags: [Nodes & assessment]
+      summary: Get a node
+      description: One node by ID.
+      responses:
+        "200":
+          description: The node.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Node"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    patch:
+      operationId: updateNode
+      tags: [Nodes & assessment]
+      summary: Rename, pause or resume a node
+      description: |
+        **Node owner or admin.** `paused: true` stops new placements and gives running instances
+        a termination notice before they are moved; `false` resumes. (Owners can also pause
+        locally with `ogm agent pause`.)
+      x-ogm-cli: ogm node pause|resume NODE_ID
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: {type: string}
+                paused: {type: boolean}
+            example: {paused: true}
+      responses:
+        "200":
+          description: The node.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Node"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    delete:
+      operationId: deleteNode
+      tags: [Nodes & assessment]
+      summary: Remove a node
+      description: |
+        **Node owner or admin.** Stops its instances (they are rescheduled elsewhere),
+        disconnects the agent and deletes the node and its token. Volumes pinned to it become
+        unreachable.
+      x-ogm-cli: ogm node rm NODE_ID
+      responses:
+        "204": {description: "Removed."}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /v1/nodes/{node}/assessment:
+    get:
+      operationId: getNodeAssessment
+      tags: [Nodes & assessment]
+      summary: Get a node's assessment
+      description: |
+        The latest onboarding audit submitted by `ogm assess`: hardware, CPU/disk benchmarks,
+        hub and internet bandwidth, NAT type, tier (`anchor`, `compute`, `burst`,
+        `unsuitable`), suggested agent limits and recommendations.
+      x-ogm-cli: ogm node assessment NODE
+      parameters:
+        - {$ref: "#/components/parameters/Node"}
+      responses:
+        "200":
+          description: The assessment.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Assessment"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /v1/speedtest/ping:
+    get:
+      operationId: speedtestPing
+      tags: [Nodes & assessment]
+      summary: Speed test - latency probe
+      description: Returns `204` immediately; used by `ogm assess` to measure hub round-trip time. Accepts a node token or a personal API key.
+      x-ogm-cli: ogm assess
+      security:
+        - nodeToken: []
+        - bearerAuth: []
+        - apiKeyHeader: []
+      responses:
+        "204": {description: "Pong."}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+  /v1/speedtest/down:
+    get:
+      operationId: speedtestDownload
+      tags: [Nodes & assessment]
+      summary: Speed test - download
+      description: Streams `bytes` of incompressible data (max and default 100 MiB) to measure download bandwidth from the hub.
+      security:
+        - nodeToken: []
+        - bearerAuth: []
+        - apiKeyHeader: []
+      parameters:
+        - name: bytes
+          in: query
+          schema: {type: integer, maximum: 104857600, default: 104857600}
+      responses:
+        "200":
+          description: Random bytes.
+          content:
+            application/octet-stream:
+              schema: {type: string, format: binary}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+  /v1/speedtest/up:
+    post:
+      operationId: speedtestUpload
+      tags: [Nodes & assessment]
+      summary: Speed test - upload
+      description: Reads and discards the body (up to 100 MiB) and reports how many bytes arrived.
+      security:
+        - nodeToken: []
+        - bearerAuth: []
+        - apiKeyHeader: []
+      requestBody:
+        content:
+          application/octet-stream:
+            schema: {type: string, format: binary}
+      responses:
+        "200":
+          description: Bytes received.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  bytes: {type: integer}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+  # ------------------------------------------------------------------ GPUs & availability
+  /v1/gpu-classes:
+    get:
+      operationId: listGPUClasses
+      tags: [GPUs & availability]
+      summary: List GPU classes
+      description: |
+        GPU classes (one per model, e.g. `rtx-4090`) with VRAM, base credits per hour, price per
+        priority (`high` ×1.5, `medium` ×1, `low` ×0.75, `batch` ×0.5) and live counts: online,
+        free (not used, node not paused) and in use. Use the `id` in
+        `container.resources.gpu_classes`.
+      x-ogm-cli: ogm gpus
+      responses:
+        "200":
+          description: GPU classes.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/GPUClassList"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+  /v1/gpu-classes/{id}:
+    patch:
+      operationId: updateGPUClass
+      tags: [GPUs & availability]
+      summary: Set a GPU class's price
+      description: "**Admin only.** Sets the base `credits_per_hour` of a GPU class."
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: GPU class ID, e.g. `rtx-4090`.
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                credits_per_hour: {type: number, minimum: 0}
+            example: {credits_per_hour: 1.2}
+      responses:
+        "204": {description: "Updated."}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+  /v1/availability:
+    get:
+      operationId: getAvailability
+      tags: [GPUs & availability]
+      summary: Get GPU availability
+      description: Same data as `GET /v1/gpu-classes`, under the name dashboards and the SaladCloud-style API use.
+      responses:
+        "200":
+          description: GPU classes with availability.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/GPUClassList"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+  # ------------------------------------------------------------------ Metrics
+  /v1/projects/{project}/containers/{group}/metrics:
+    get:
+      operationId: getGroupMetrics
+      tags: [Metrics]
+      summary: Get a group's metrics
+      description: |
+        Per-minute series for the last `minutes` (max 1440): gateway requests, 4xx/5xx,
+        latency p50/p95/p99, ready/desired replicas, CPU, memory and GPU utilization, plus a
+        summary over the window. Kept in memory for 24 h; a hub restart starts fresh.
+      x-ogm-cli: ogm metrics GROUP [--minutes 60]
+      parameters:
+        - {$ref: "#/components/parameters/Project"}
+        - {$ref: "#/components/parameters/Group"}
+        - name: minutes
+          in: query
+          schema: {type: integer, default: 60, minimum: 1, maximum: 1440}
+      responses:
+        "200":
+          description: The series.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/GroupMetrics"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /metrics:
+    get:
+      operationId: getPrometheusMetrics
+      tags: [Metrics]
+      summary: Prometheus metrics
+      description: |
+        Prometheus text exposition for the whole hub: `ogm_info`, `ogm_node_up`,
+        `ogm_node_gpus`, GPU utilization/memory per node, `ogm_group_desired_replicas`,
+        `ogm_group_instances{state}`, ready instances, CPU/memory per group, gateway request
+        counters and latency histograms, queue depths.
+
+        Needs a key of an **admin** user that is not project-scoped; a `viewer` scoped key
+        minted by an admin is ideal:
+
+        ```yaml
+        scrape_configs:
+          - job_name: ogm
+            scheme: https
+            static_configs: [{targets: [gpu.example.com]}]
+            authorization: {credentials: ogmk_...}
+        ```
+      responses:
+        "200":
+          description: Prometheus text format.
+          content:
+            text/plain:
+              schema: {type: string}
+              example: |
+                ogm_info{version="0.4.0"} 1
+                ogm_node_up{node="alice-desktop",node_id="node_4kq2",country="de"} 1
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+  # ------------------------------------------------------------------ MCP
+  /v1/mcp:
+    post:
+      operationId: mcpRequest
+      tags: [MCP]
+      summary: MCP JSON-RPC request
+      description: |
+        [Model Context Protocol](https://modelcontextprotocol.io) over Streamable HTTP
+        (protocol `2025-06-18`; `2025-03-26` and `2024-11-05` also accepted). Send JSON-RPC 2.0
+        messages (single or batch); responses are plain `application/json`.
+
+        `initialize` returns an `Mcp-Session-Id` header; send it on later requests. Sessions
+        belong to the user who created them; an unknown or expired session gets `404` (send
+        `initialize` again). `?project=NAME` sets the default project for project-scoped tools.
+
+        Tools (≈50: `list_groups`, `deploy_group`, `group_logs`, `submit_job`, `kv_put`,
+        `api_operations`, …) run as in-process sub-requests against this REST API with **your**
+        credential, so permissions and validation are identical. See `docs/mcp.md`.
+
+        ```sh
+        claude mcp add --transport http ogm https://gpu.example.com/v1/mcp --header "Authorization: Bearer ogm_..."
+        ```
+      x-ogm-cli: ogm mcp
+      parameters:
+        - name: project
+          in: query
+          description: Default project for tools.
+          schema: {type: string}
+        - name: Mcp-Session-Id
+          in: header
+          description: Session ID from `initialize`.
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/JSONRPCRequest"}
+            examples:
+              initialize:
+                summary: initialize
+                value: {jsonrpc: "2.0", id: 1, method: initialize, params: {protocolVersion: "2025-06-18", capabilities: {}, clientInfo: {name: curl, version: "1"}}}
+              toolsList:
+                summary: tools/list
+                value: {jsonrpc: "2.0", id: 2, method: tools/list}
+              toolCall:
+                summary: tools/call
+                value: {jsonrpc: "2.0", id: 3, method: tools/call, params: {name: list_groups, arguments: {project: default}}}
+      responses:
+        "200":
+          description: JSON-RPC response(s).
+          headers:
+            Mcp-Session-Id: {description: "Set on `initialize`.", schema: {type: string}}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/JSONRPCResponse"}
+        "202": {description: "Accepted (notifications only, no response body)."}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {description: "Unknown or expired session; re-initialize."}
+    delete:
+      operationId: mcpEndSession
+      tags: [MCP]
+      summary: End an MCP session
+      description: Terminates the session named by `Mcp-Session-Id`.
+      parameters:
+        - name: Mcp-Session-Id
+          in: header
+          required: true
+          schema: {type: string}
+      responses:
+        "204": {description: "Session ended."}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {description: "Unknown session."}
+    get:
+      operationId: mcpOpenStream
+      tags: [MCP]
+      summary: MCP server-sent stream (not supported)
+      description: |
+        Always `405 Method Not Allowed` with `Allow: POST, DELETE`: this server never opens a
+        server-initiated SSE stream. Clients that probe it fall back to plain POST.
+      security: []
+      responses:
+        "405":
+          description: Not supported.
+          content:
+            application/problem+json:
+              schema: {$ref: "#/components/schemas/Problem"}
+  # ------------------------------------------------------------------ Agent (internal)
+  /v1/agent/connect:
+    get:
+      operationId: agentConnect
+      tags: [Agent (internal)]
+      summary: Agent control tunnel (WebSocket)
+      description: |
+        The node agent's persistent connection. Upgrades to a WebSocket carrying a yamux
+        session: one control stream (hello, heartbeats, instance commands, job delivery, log
+        shipping) plus streams the hub opens for gateway traffic and volume transfers. Auth is
+        the node token as `Authorization: Bearer ogmn_…`. Not for direct use.
+      security:
+        - nodeToken: []
+      parameters:
+        - {name: Upgrade, in: header, required: true, schema: {type: string, const: websocket}}
+      responses:
+        "101": {description: "Switching protocols (WebSocket + yamux)."}
+        "401": {description: "Invalid node token (plain text)."}
+  /v1/agent/assessment:
+    post:
+      operationId: submitAssessment
+      tags: [Agent (internal)]
+      summary: Submit a node assessment
+      description: Stores the onboarding audit for the node that owns the token. Sent by `ogm assess --token` and the installer.
+      x-ogm-cli: ogm assess --token NODE_TOKEN
+      security:
+        - nodeToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/Assessment"}
+      responses:
+        "200":
+          description: Stored.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  node_id: {type: string}
+                  tier: {type: string}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+  # ------------------------------------------------------------------ Misc
+  /v1/cluster:
+    get:
+      operationId: getCluster
+      tags: [Misc]
+      summary: Get the cluster summary
+      description: "**Public.** Name, version, node/GPU/VRAM totals, users, groups, running instances, pending jobs and URLs."
+      x-ogm-cli: ogm status
+      security: []
+      responses:
+        "200":
+          description: The summary.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ClusterInfo"}
+  /.well-known/jwks.json:
+    get:
+      operationId: getJWKS
+      tags: [Misc]
+      summary: Get the instance-identity JWKS
+      description: |
+        **Public.** The Ed25519 public key (JWK set) that signs instance identity tokens (from
+        IMDS `GET /v1/token?audience=A`: `sub` = instance ID, claims `project`, `container_group`,
+        `node_id`, `aud` = A (default `ogm-workload`), 1 h). Verify tokens against it, checking
+        `aud`, to prove a request comes from your workload. Only `aud: ogm-hub` tokens are
+        accepted by this API.
+      security: []
+      responses:
+        "200":
+          description: JWK set.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  keys: {type: array, items: {type: object, additionalProperties: true}}
+              example: {keys: [{kty: OKP, crv: Ed25519, alg: EdDSA, use: sig, kid: "k1", x: "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"}]}
+  /healthz:
+    get:
+      operationId: healthz
+      tags: [Misc]
+      summary: Health check
+      description: "**Public.** Returns `ok` when the hub is serving."
+      security: []
+      responses:
+        "200":
+          description: OK.
+          content:
+            text/plain:
+              schema: {type: string}
+              example: "ok\n"
+  /install.sh:
+    get:
+      operationId: getInstallScript
+      tags: [Misc]
+      summary: Get the agent installer
+      description: |
+        **Public.** POSIX shell installer for a contributor machine: downloads `ogm` from
+        `/dl/{os}-{arch}`, audits the machine (`ogm assess`), applies suggested limits and
+        installs a systemd service.
+
+        ```sh
+        curl -fsSL https://gpu.example.com/install.sh | sh -s -- --token ogmn_... [--profile gaming] [--no-assess] [agent flags]
+        ```
+      security: []
+      responses:
+        "200":
+          description: The script.
+          content:
+            text/x-shellscript:
+              schema: {type: string}
+  /dl/{target}:
+    get:
+      operationId: downloadBinary
+      tags: [Misc]
+      summary: Download the ogm binary
+      description: |
+        **Public.** The `ogm` binary for `{os}-{arch}` (e.g. `linux-amd64`, `linux-arm64`,
+        `darwin-arm64`) from the hub's `--dist-dir`, or the hub's own binary for its platform.
+        `404` if that build isn't available.
+      security: []
+      parameters:
+        - name: target
+          in: path
+          required: true
+          schema: {type: string, example: linux-amd64}
+      responses:
+        "200":
+          description: The binary.
+          content:
+            application/octet-stream:
+              schema: {type: string, format: binary}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /:
+    get:
+      operationId: getDashboard
+      tags: [Misc]
+      summary: Web dashboard
+      description: "**Public.** The single-page web dashboard (static files; it calls this API with the key you enter). Any path not matched by another route serves dashboard assets."
+      security: []
+      responses:
+        "200":
+          description: HTML.
+          content:
+            text/html:
+              schema: {type: string}
+  /docs:
+    get:
+      operationId: getDocs
+      tags: [Misc]
+      summary: API reference (this page)
+      description: "**Public.** Interactive API reference rendered by Scalar from `/openapi.json`. Paste a key under *Authentication* to try requests."
+      security: []
+      responses:
+        "200":
+          description: HTML.
+          content:
+            text/html:
+              schema: {type: string}
+  /reference:
+    get:
+      operationId: getReference
+      tags: [Misc]
+      summary: Redirect to the API reference
+      description: "**Public.** Redirects to `/docs`."
+      security: []
+      responses:
+        "301": {description: "Redirect to /docs."}
+  /openapi.json:
+    get:
+      operationId: getOpenAPIJSON
+      tags: [Misc]
+      summary: OpenAPI document (JSON)
+      description: "**Public.** This OpenAPI 3.1 document as JSON, with `info.version` set to the hub version and the server URL set to the hub's public URL. Feed it to code generators, Postman or AI agents."
+      security: []
+      responses:
+        "200":
+          description: OpenAPI document.
+          content:
+            application/json:
+              schema: {type: object}
+  /openapi.yaml:
+    get:
+      operationId: getOpenAPIYAML
+      tags: [Misc]
+      summary: OpenAPI document (YAML)
+      description: "**Public.** The same document as YAML."
+      security: []
+      responses:
+        "200":
+          description: OpenAPI document.
+          content:
+            application/yaml:
+              schema: {type: string}
+  /llms.txt:
+    get:
+      operationId: getLLMsTxt
+      tags: [Misc]
+      summary: LLM-friendly API index
+      description: "**Public.** A plain-text index of every operation (`METHOD path — summary`) following the [llms.txt](https://llmstxt.org) convention, with pointers to `/openapi.json` and the MCP endpoint."
+      security: []
+      responses:
+        "200":
+          description: Markdown text.
+          content:
+            text/plain:
+              schema: {type: string}
+  # ------------------------------------------------------------------ Gateway (protocol)
+  /gw/{project}/{group}/{path}:
+    parameters:
+      - {$ref: "#/components/parameters/Project"}
+      - {$ref: "#/components/parameters/Group"}
+      - name: path
+        in: path
+        required: true
+        description: Any path (may contain `/`); forwarded to the container with the `/gw/{project}/{group}` prefix stripped.
+        schema: {type: string}
+    get:
+      operationId: gatewayGet
+      tags: [Gateway]
+      summary: Call a group through the gateway
+      x-ogm-protocol: true
+      x-ogm-cli: ogm curl GROUP [PATH] [curl args...]
+      description: |
+        Proxies the request to a ready instance of the group (`networking` must be set). **Any
+        HTTP method** works the same way; `GET` and `POST` are listed as examples. The prefix is
+        stripped and `X-Forwarded-Prefix` is set; `/gw/{project}/{group}` without a trailing
+        slash redirects. Host mode does the same at `https://{group}-{project}.{gateway-domain}/…`
+        when the hub runs with `--gateway-domain`.
+
+        **Auth** (when `networking.auth` is on): a member's API key or the group's share token
+        (`gateway_token`, `ogmg_…`), sent as `OGM-Api-Key`, `Authorization: Bearer` (so
+        OpenAI-style SDKs work by setting `api_key`), or `?ogm_token=` (browsers, websockets;
+        stripped before forwarding).
+
+        **Behaviour:** websockets, SSE and chunked streaming pass through; responses carry
+        `X-OGM-Instance-Id` and `X-OGM-Node-Id`; during cold starts (or scale-from-zero with
+        `http_autoscaler`) requests wait for a ready instance up to `client_request_timeout_ms`;
+        a request is retried once on another instance if the backend connection fails (or if it
+        is idempotent with no body). `max_concurrency` / `single_connection_limit` queue excess
+        requests.
+      security:
+        - {}
+        - bearerAuth: []
+        - apiKeyHeader: []
+        - gatewayTokenQuery: []
+      responses:
+        "200": {description: "Whatever your container returns."}
+        "307": {description: "Redirect to add the trailing slash."}
+        "401": {description: "Missing or invalid credentials (when `networking.auth` is on)."}
+        "404": {description: "No such group, or the group has no networking."}
+        "502": {description: "Instance unreachable (after one retry)."}
+        "503": {description: "The group has no instances that can become ready."}
+        "504": {description: "No instance became free/ready within `client_request_timeout_ms`."}
+        "524": {description: "The app didn't send response headers within `server_response_timeout_ms`."}
+    post:
+      operationId: gatewayPost
+      tags: [Gateway]
+      summary: Call a group through the gateway (POST)
+      x-ogm-protocol: true
+      description: |
+        Same as `GET`, for requests with a body, e.g. an OpenAI-compatible endpoint:
+
+        ```python
+        from openai import OpenAI
+        client = OpenAI(base_url="https://gpu.example.com/gw/default/llama/v1", api_key="ogmg_...")
+        ```
+      security:
+        - {}
+        - bearerAuth: []
+        - apiKeyHeader: []
+        - gatewayTokenQuery: []
+      requestBody:
+        content:
+          "*/*":
+            schema: {}
+      responses:
+        "200": {description: "Whatever your container returns."}
+        "401": {description: "Missing or invalid credentials."}
+        "502": {description: "Instance unreachable."}
+        "503": {description: "No instances can become ready."}
+        "504": {description: "Timed out waiting for an instance."}
+        "524": {description: "The app didn't respond in time."}
+  # ------------------------------------------------------------------ Registry (protocol)
+  /v2/:
+    get:
+      operationId: registryPing
+      tags: [Registry]
+      summary: Registry API version check
+      x-ogm-protocol: true
+      description: |
+        OCI Distribution base endpoint: `200` when authenticated, `401` with
+        `WWW-Authenticate: Basic realm="ogm"` otherwise. Every registry response carries
+        `Docker-Distribution-API-Version: registry/2.0`.
+
+        **Auth:** a **personal** API key (`ogm_…`) as `Authorization: Bearer`, `OGM-Api-Key`,
+        or the Basic-auth password (so `docker login` works with any user name). Node tokens
+        (`ogmn_…`) are pull-only. Members can push/pull repositories of their projects.
+
+        ```sh
+        docker login gpu.example.com -u alice -p ogm_...
+        docker push gpu.example.com/default/myapp:1.0
+        ```
+        (`ogm push` does this for you, and `ogm registry-proxy` exposes the registry on
+        localhost for plain-HTTP setups.)
+      security:
+        - basicAuth: []
+        - bearerAuth: []
+      responses:
+        "200": {description: "Authenticated."}
+        "401": {$ref: "#/components/responses/RegistryError"}
+  /v2/_catalog:
+    get:
+      operationId: registryCatalog
+      tags: [Registry]
+      summary: List repositories
+      x-ogm-protocol: true
+      x-ogm-cli: ogm images
+      description: Repositories (with at least one tag) in projects you can access.
+      security:
+        - basicAuth: []
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Repositories.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  repositories: {type: array, items: {type: string}}
+              example: {repositories: [default/myapp, alice/sdxl]}
+        "401": {$ref: "#/components/responses/RegistryError"}
+  /v2/{project}/{name}/tags/list:
+    get:
+      operationId: registryListTags
+      tags: [Registry]
+      summary: List tags
+      x-ogm-protocol: true
+      description: Tags of the repository `{project}/{name}`, sorted.
+      security:
+        - basicAuth: []
+        - bearerAuth: []
+      parameters:
+        - {$ref: "#/components/parameters/Project"}
+        - {$ref: "#/components/parameters/RepoName"}
+      responses:
+        "200":
+          description: Tags.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name: {type: string}
+                  tags: {type: array, items: {type: string}}
+              example: {name: default/myapp, tags: ["1.0", latest]}
+        "401": {$ref: "#/components/responses/RegistryError"}
+        "403": {$ref: "#/components/responses/RegistryError"}
+  /v2/{project}/{name}/manifests/{reference}:
+    parameters:
+      - {$ref: "#/components/parameters/Project"}
+      - {$ref: "#/components/parameters/RepoName"}
+      - name: reference
+        in: path
+        required: true
+        description: A tag or a digest (`sha256:…`).
+        schema: {type: string}
+    get:
+      operationId: registryGetManifest
+      tags: [Registry]
+      summary: Get a manifest
+      x-ogm-protocol: true
+      description: The manifest or image index, with its media type as `Content-Type` and `Docker-Content-Digest`.
+      security: [{basicAuth: []}, {bearerAuth: []}]
+      responses:
+        "200":
+          description: The manifest.
+          content:
+            application/vnd.oci.image.manifest.v1+json:
+              schema: {type: object}
+            application/vnd.oci.image.index.v1+json:
+              schema: {type: object}
+        "404": {$ref: "#/components/responses/RegistryError"}
+    head:
+      operationId: registryHeadManifest
+      tags: [Registry]
+      summary: Check a manifest
+      x-ogm-protocol: true
+      description: Like GET without the body; used to resolve a tag to a digest.
+      security: [{basicAuth: []}, {bearerAuth: []}]
+      responses:
+        "200": {description: "Exists; see `Docker-Content-Digest`."}
+        "404": {$ref: "#/components/responses/RegistryError"}
+    put:
+      operationId: registryPutManifest
+      tags: [Registry]
+      summary: Push a manifest
+      x-ogm-protocol: true
+      x-ogm-cli: ogm push [--multiarch] LOCAL_IMAGE[:TAG] [NAME[:TAG]]
+      description: |
+        Stores a manifest or index (max 4 MiB; referenced blobs must exist) under a tag or
+        digest. With `OGM-Merge-Platforms: 1` the manifest is merged into the tag's existing
+        platforms (multi-arch pushes from separate machines; `ogm push --multiarch`).
+      security: [{basicAuth: []}, {bearerAuth: []}]
+      parameters:
+        - name: OGM-Merge-Platforms
+          in: header
+          schema: {type: string, enum: ["1"]}
+      requestBody:
+        required: true
+        content:
+          application/vnd.oci.image.manifest.v1+json:
+            schema: {type: object}
+          application/vnd.oci.image.index.v1+json:
+            schema: {type: object}
+      responses:
+        "201": {description: "Stored; `Location` and `Docker-Content-Digest` set."}
+        "400": {$ref: "#/components/responses/RegistryError"}
+        "403": {$ref: "#/components/responses/RegistryError"}
+    delete:
+      operationId: registryDeleteManifest
+      tags: [Registry]
+      summary: Delete a manifest or tag
+      x-ogm-protocol: true
+      description: By digest, deletes the manifest and every tag pointing at it; by tag, deletes just the tag.
+      security: [{basicAuth: []}, {bearerAuth: []}]
+      responses:
+        "202": {description: "Deleted."}
+        "404": {$ref: "#/components/responses/RegistryError"}
+  /v2/{project}/{name}/blobs/{digest}:
+    parameters:
+      - {$ref: "#/components/parameters/Project"}
+      - {$ref: "#/components/parameters/RepoName"}
+      - name: digest
+        in: path
+        required: true
+        schema: {type: string, pattern: "^sha256:[a-f0-9]{64}$"}
+    get:
+      operationId: registryGetBlob
+      tags: [Registry]
+      summary: Download a blob
+      x-ogm-protocol: true
+      description: A layer or config blob. Supports `Range` for resumed pulls.
+      security: [{basicAuth: []}, {bearerAuth: []}]
+      responses:
+        "200":
+          description: The blob.
+          content:
+            application/octet-stream:
+              schema: {type: string, format: binary}
+        "404": {$ref: "#/components/responses/RegistryError"}
+    head:
+      operationId: registryHeadBlob
+      tags: [Registry]
+      summary: Check a blob
+      x-ogm-protocol: true
+      description: "`200` with `Content-Length` and `Docker-Content-Digest` if the blob exists."
+      security: [{basicAuth: []}, {bearerAuth: []}]
+      responses:
+        "200": {description: "Exists."}
+        "404": {$ref: "#/components/responses/RegistryError"}
+  /v2/{project}/{name}/blobs/uploads/:
+    post:
+      operationId: registryStartUpload
+      tags: [Registry]
+      summary: Start a blob upload
+      x-ogm-protocol: true
+      description: |
+        Starts an upload session (`202`, `Location: /v2/…/blobs/uploads/{uuid}`). With
+        `?digest=` and a body it is a monolithic upload (`201`). With `?mount=sha256:…` and an
+        existing blob it is a cross-repository mount (`201`, no data sent).
+      security: [{basicAuth: []}, {bearerAuth: []}]
+      parameters:
+        - {$ref: "#/components/parameters/Project"}
+        - {$ref: "#/components/parameters/RepoName"}
+        - {name: digest, in: query, schema: {type: string}}
+        - {name: mount, in: query, schema: {type: string}}
+        - {name: from, in: query, schema: {type: string}}
+      responses:
+        "201": {description: "Blob created or mounted."}
+        "202": {description: "Upload session started."}
+        "403": {$ref: "#/components/responses/RegistryError"}
+  /v2/{project}/{name}/blobs/uploads/{uuid}:
+    parameters:
+      - {$ref: "#/components/parameters/Project"}
+      - {$ref: "#/components/parameters/RepoName"}
+      - name: uuid
+        in: path
+        required: true
+        schema: {type: string, pattern: "^[a-f0-9]{32}$"}
+    patch:
+      operationId: registryUploadChunk
+      tags: [Registry]
+      summary: Upload a blob chunk
+      x-ogm-protocol: true
+      description: Appends the body to the upload; `Range` reports the bytes received so far.
+      security: [{basicAuth: []}, {bearerAuth: []}]
+      requestBody:
+        content:
+          application/octet-stream:
+            schema: {type: string, format: binary}
+      responses:
+        "202": {description: "Chunk accepted."}
+        "404": {$ref: "#/components/responses/RegistryError"}
+    put:
+      operationId: registryCompleteUpload
+      tags: [Registry]
+      summary: Complete a blob upload
+      x-ogm-protocol: true
+      description: Appends an optional final chunk and commits the blob; the content must hash to `?digest=`.
+      security: [{basicAuth: []}, {bearerAuth: []}]
+      parameters:
+        - {name: digest, in: query, required: true, schema: {type: string}}
+      requestBody:
+        content:
+          application/octet-stream:
+            schema: {type: string, format: binary}
+      responses:
+        "201": {description: "Blob created."}
+        "400": {$ref: "#/components/responses/RegistryError"}
+    get:
+      operationId: registryUploadStatus
+      tags: [Registry]
+      summary: Get upload progress
+      x-ogm-protocol: true
+      description: "`204` with `Range: 0-N` (bytes received) for resuming."
+      security: [{basicAuth: []}, {bearerAuth: []}]
+      responses:
+        "204": {description: "Progress in `Range`."}
+        "404": {$ref: "#/components/responses/RegistryError"}
+    delete:
+      operationId: registryCancelUpload
+      tags: [Registry]
+      summary: Cancel a blob upload
+      x-ogm-protocol: true
+      description: Discards the upload session.
+      security: [{basicAuth: []}, {bearerAuth: []}]
+      responses:
+        "204": {description: "Cancelled."}
+  # ------------------------------------------------------------------ S3 API (protocol)
+  /s3/:
+    get:
+      operationId: s3ListBuckets
+      tags: [S3 API]
+      summary: ListBuckets
+      x-ogm-protocol: true
+      x-ogm-cli: ogm s3 ls
+      description: |
+        Buckets of the credential's project (bucket names are global across the hub, but each
+        bucket belongs to one project). S3 XML `ListAllMyBucketsResult`.
+
+        **Authentication** (all `/s3` operations): AWS SigV4 with an S3 access key from
+        `POST /v1/projects/{project}/s3-credentials`: header auth (`x-amz-content-sha256` may be a
+        hex hash, `UNSIGNED-PAYLOAD`, or aws-chunked streaming with or without trailers),
+        SigV4 presigned URLs (up to 7 days) or SigV2 presigned URLs. Clock skew ≤ 15 min.
+        Errors are S3 XML (`<Error><Code>…</Code><Message>…</Message></Error>`).
+
+        ```python
+        boto3.client("s3", endpoint_url="https://gpu.example.com/s3",
+                     aws_access_key_id="OGMS3...", aws_secret_access_key="...",
+                     config=Config(s3={"addressing_style": "path"}))
+        ```
+      security: [{s3SigV4: []}]
+      responses:
+        "200": {$ref: "#/components/responses/S3XML"}
+        "403": {$ref: "#/components/responses/S3Error"}
+  /s3/{bucket}:
+    parameters:
+      - {$ref: "#/components/parameters/Bucket"}
+    put:
+      operationId: s3CreateBucket
+      tags: [S3 API]
+      summary: CreateBucket
+      x-ogm-protocol: true
+      x-ogm-cli: ogm s3 mb BUCKET
+      description: |
+        Creates a bucket in the credential's project. S3 naming rules (3-63 chars of `a-z0-9.-`).
+        `LocationConstraint` is ignored. `PUT ?acl` is accepted and ignored (access is per project).
+      security: [{s3SigV4: []}]
+      responses:
+        "200": {description: "Created."}
+        "400": {$ref: "#/components/responses/S3Error"}
+        "409": {$ref: "#/components/responses/S3Error"}
+    head:
+      operationId: s3HeadBucket
+      tags: [S3 API]
+      summary: HeadBucket
+      x-ogm-protocol: true
+      description: "`200` (with `X-Amz-Bucket-Region: us-east-1`) if the bucket exists and belongs to your project."
+      security: [{s3SigV4: []}]
+      responses:
+        "200": {description: "Exists."}
+        "404": {$ref: "#/components/responses/S3Error"}
+    get:
+      operationId: s3ListObjects
+      tags: [S3 API]
+      summary: ListObjectsV2 / ListObjects and bucket subresources
+      x-ogm-protocol: true
+      x-ogm-cli: ogm s3 ls BUCKET[/PREFIX] [-r]
+      description: |
+        - `?list-type=2`: **ListObjectsV2** — `prefix`, `delimiter` (→ `CommonPrefixes`),
+          `max-keys` (≤ 1000), `continuation-token`, `start-after`, `encoding-type=url`.
+        - no `list-type`: **ListObjects** (v1) — `prefix`, `delimiter`, `marker`, `max-keys`.
+        - `?location`: **GetBucketLocation** (always empty = `us-east-1`).
+        - `?versioning`: **GetBucketVersioning** (always unversioned).
+        - `?acl`: **GetBucketAcl** (fixed: the project has `FULL_CONTROL`).
+        - `?uploads`: **ListMultipartUploads** (`prefix`; first 1000).
+        - `?policy`, `?cors`, `?lifecycle`, `?tagging`: the matching `NoSuch…` error; other
+          unsupported subresources return `NotImplemented`.
+      security: [{s3SigV4: []}]
+      parameters:
+        - {name: list-type, in: query, schema: {type: string, enum: ["2"]}}
+        - {name: prefix, in: query, schema: {type: string}}
+        - {name: delimiter, in: query, schema: {type: string}}
+        - {name: max-keys, in: query, schema: {type: integer, maximum: 1000}}
+        - {name: continuation-token, in: query, schema: {type: string}}
+        - {name: start-after, in: query, schema: {type: string}}
+        - {name: marker, in: query, schema: {type: string}}
+      responses:
+        "200": {$ref: "#/components/responses/S3XML"}
+        "404": {$ref: "#/components/responses/S3Error"}
+    post:
+      operationId: s3DeleteObjects
+      tags: [S3 API]
+      summary: DeleteObjects
+      x-ogm-protocol: true
+      description: "`POST ?delete` with a `<Delete>` XML body: deletes up to 1000 keys; `Quiet` supported."
+      security: [{s3SigV4: []}]
+      parameters:
+        - {name: delete, in: query, required: true, allowEmptyValue: true, schema: {type: string}}
+      requestBody:
+        content:
+          application/xml:
+            schema: {type: string}
+      responses:
+        "200": {$ref: "#/components/responses/S3XML"}
+        "400": {$ref: "#/components/responses/S3Error"}
+    delete:
+      operationId: s3DeleteBucket
+      tags: [S3 API]
+      summary: DeleteBucket
+      x-ogm-protocol: true
+      x-ogm-cli: ogm s3 rb BUCKET
+      description: Deletes an empty bucket (`BucketNotEmpty` otherwise); pending multipart uploads are discarded.
+      security: [{s3SigV4: []}]
+      responses:
+        "204": {description: "Deleted."}
+        "409": {$ref: "#/components/responses/S3Error"}
+  /s3/{bucket}/{key}:
+    parameters:
+      - {$ref: "#/components/parameters/Bucket"}
+      - name: key
+        in: path
+        required: true
+        description: Object key (may contain `/`, up to 1024 bytes).
+        schema: {type: string}
+    put:
+      operationId: s3PutObject
+      tags: [S3 API]
+      summary: PutObject / CopyObject / UploadPart
+      x-ogm-protocol: true
+      x-ogm-cli: ogm s3 cp LOCAL s3://BUCKET/KEY
+      description: |
+        - **PutObject**: body up to 5 GiB. `Content-MD5` is checked if sent. Stores
+          `Content-Type`, `x-amz-meta-*`, `Cache-Control`, `Content-Disposition`,
+          `Content-Encoding`, `Content-Language`, `Expires`. ETag = MD5.
+        - **CopyObject**: with `x-amz-copy-source: /bucket/key` (same project);
+          `x-amz-metadata-directive: COPY|REPLACE`, `x-amz-copy-source-if-(none-)match`.
+        - **UploadPart** (`?partNumber=N&uploadId=U`, parts 1-10000 up to 5 GiB) and
+          **UploadPartCopy** (plus `x-amz-copy-source`, optional `x-amz-copy-source-range`).
+        - `?acl`: accepted and ignored.
+      security: [{s3SigV4: []}]
+      parameters:
+        - {name: partNumber, in: query, schema: {type: integer, minimum: 1, maximum: 10000}}
+        - {name: uploadId, in: query, schema: {type: string}}
+        - {name: x-amz-copy-source, in: header, schema: {type: string}}
+      requestBody:
+        content:
+          application/octet-stream:
+            schema: {type: string, format: binary}
+      responses:
+        "200": {description: "Stored; `ETag` header set."}
+        "400": {$ref: "#/components/responses/S3Error"}
+        "403": {$ref: "#/components/responses/S3Error"}
+    get:
+      operationId: s3GetObject
+      tags: [S3 API]
+      summary: GetObject / ListParts
+      x-ogm-protocol: true
+      x-ogm-cli: ogm s3 cp s3://BUCKET/KEY LOCAL
+      description: |
+        - **GetObject**: `Range` (incl. multi-range), `If-None-Match` / `If-Match` /
+          `If-Modified-Since`, `response-content-*` overrides; presigned URLs work here.
+        - `?uploadId=U`: **ListParts** (`max-parts`, `part-number-marker`).
+        - `?acl`: **GetObjectAcl**.
+      security: [{s3SigV4: []}]
+      parameters:
+        - {name: Range, in: header, schema: {type: string}}
+        - {name: uploadId, in: query, schema: {type: string}}
+      responses:
+        "200":
+          description: The object (or XML for subresources).
+          content:
+            application/octet-stream:
+              schema: {type: string, format: binary}
+        "206": {description: "Partial content."}
+        "304": {description: "Not modified."}
+        "404": {$ref: "#/components/responses/S3Error"}
+    head:
+      operationId: s3HeadObject
+      tags: [S3 API]
+      summary: HeadObject
+      x-ogm-protocol: true
+      description: Object metadata (size, ETag, content type, `x-amz-meta-*`) without the body.
+      security: [{s3SigV4: []}]
+      responses:
+        "200": {description: "Exists."}
+        "404": {description: "No such key."}
+    delete:
+      operationId: s3DeleteObject
+      tags: [S3 API]
+      summary: DeleteObject / AbortMultipartUpload
+      x-ogm-protocol: true
+      x-ogm-cli: ogm s3 rm s3://BUCKET/KEY
+      description: Deletes the object (succeeds for missing keys, as in S3). With `?uploadId=U`, aborts that multipart upload.
+      security: [{s3SigV4: []}]
+      parameters:
+        - {name: uploadId, in: query, schema: {type: string}}
+      responses:
+        "204": {description: "Deleted."}
+        "404": {$ref: "#/components/responses/S3Error"}
+    post:
+      operationId: s3MultipartUpload
+      tags: [S3 API]
+      summary: CreateMultipartUpload / CompleteMultipartUpload
+      x-ogm-protocol: true
+      description: |
+        - `?uploads`: **CreateMultipartUpload**, returns an `UploadId`.
+        - `?uploadId=U` with a `<CompleteMultipartUpload>` body: **CompleteMultipartUpload**.
+          Parts in ascending order, all but the last ≥ 5 MiB; ETag is `md5(part md5s)-N`.
+      security: [{s3SigV4: []}]
+      parameters:
+        - {name: uploads, in: query, allowEmptyValue: true, schema: {type: string}}
+        - {name: uploadId, in: query, schema: {type: string}}
+      requestBody:
+        content:
+          application/xml:
+            schema: {type: string}
+      responses:
+        "200": {$ref: "#/components/responses/S3XML"}
+        "400": {$ref: "#/components/responses/S3Error"}
+        "404": {$ref: "#/components/responses/S3Error"}
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        `Authorization: Bearer <credential>` where the credential is a personal API key
+        (`ogm_…`), a scoped API key (`ogmk_…`) or an instance identity JWT from IMDS
+        (`GET $OGM_IMDS_URL/v1/token?audience=ogm-hub` inside a container). See *Authentication* above for roles.
+    apiKeyHeader:
+      type: apiKey
+      in: header
+      name: OGM-Api-Key
+      description: The same credentials as `bearerAuth`, in the `OGM-Api-Key` header.
+    nodeToken:
+      type: http
+      scheme: bearer
+      description: A node token (`ogmn_…`) from `POST /v1/nodes`. Used by agents.
+    gatewayTokenQuery:
+      type: apiKey
+      in: query
+      name: ogm_token
+      description: Gateway only. A member API key or the group's share token (`ogmg_…`) as a query parameter (stripped before forwarding).
+    basicAuth:
+      type: http
+      scheme: basic
+      description: Registry only. Any user name, your personal API key as the password (`docker login`).
+    s3SigV4:
+      type: apiKey
+      in: header
+      name: Authorization
+      description: S3 only. AWS Signature Version 4 (`AWS4-HMAC-SHA256 Credential=OGMS3…/…`) with an S3 access key, or a presigned URL.
+  parameters:
+    Project:
+      name: project
+      in: path
+      required: true
+      description: Project name. Your personal project is your user name; `default` is shared.
+      schema: {type: string}
+      example: default
+    Group:
+      name: group
+      in: path
+      required: true
+      description: Container group name.
+      schema: {type: string}
+      example: llama
+    Instance:
+      name: instance
+      in: path
+      required: true
+      description: "Instance ID (`inst_…`)."
+      schema: {type: string}
+    Queue:
+      name: queue
+      in: path
+      required: true
+      description: Queue name.
+      schema: {type: string}
+      example: sdxl
+    Node:
+      name: node
+      in: path
+      required: true
+      description: "Node ID (`node_…`)."
+      schema: {type: string}
+    SnapshotID:
+      name: id
+      in: path
+      required: true
+      description: "Snapshot ID (`snap_…`)."
+      schema: {type: string}
+    KVTable:
+      name: table
+      in: path
+      required: true
+      description: "Table name: 1-64 of `[A-Za-z0-9_.-]`, not starting with `.` or `-`."
+      schema: {type: string, pattern: "^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$"}
+      example: sessions
+    KVKey:
+      name: key
+      in: path
+      required: true
+      description: Key (1-1024 bytes; may contain `/`).
+      schema: {type: string}
+      example: user/42
+    FilePath:
+      name: path
+      in: path
+      required: true
+      description: File path within the project store (may contain `/`; no `..`).
+      schema: {type: string}
+      example: datasets/train.parquet
+    EventLimit:
+      name: limit
+      in: query
+      description: Maximum events (1-5000).
+      schema: {type: integer, default: 200, minimum: 1, maximum: 5000}
+    RepoName:
+      name: name
+      in: path
+      required: true
+      description: Repository name within the project (may contain `/`).
+      schema: {type: string}
+      example: myapp
+    Bucket:
+      name: bucket
+      in: path
+      required: true
+      description: Bucket name.
+      schema: {type: string}
+      example: datasets
+  responses:
+    BadRequest:
+      description: Invalid JSON, invalid parameters or validation failure (see `errors`).
+      content:
+        application/problem+json:
+          schema: {$ref: "#/components/schemas/Problem"}
+          examples:
+            validation:
+              summary: Validation failure
+              value: {type: "https://ogm.dev/errors/validation", title: validation failed, status: 400, errors: {container.image: [is required]}}
+            invalidJSON:
+              summary: Malformed body
+              value: {type: "https://ogm.dev/errors/invalid_json", title: invalid json, status: 400, detail: "unexpected end of JSON input"}
+    Unauthorized:
+      description: Missing, invalid or expired credential.
+      content:
+        application/problem+json:
+          schema: {$ref: "#/components/schemas/Problem"}
+          example: {type: "https://ogm.dev/errors/unauthorized", title: unauthorized, status: 401, detail: "missing API key (OGM-Api-Key header or Bearer token)"}
+    Forbidden:
+      description: Not allowed (not a project member, admin only, or outside the key's scope).
+      content:
+        application/problem+json:
+          schema: {$ref: "#/components/schemas/Problem"}
+          example: {type: "https://ogm.dev/errors/forbidden", title: forbidden, status: 403, detail: "not a member of project research"}
+    NotFound:
+      description: The resource or project does not exist.
+      content:
+        application/problem+json:
+          schema: {$ref: "#/components/schemas/Problem"}
+          example: {type: "https://ogm.dev/errors/not_found", title: not found, status: 404, detail: "container group not found"}
+    Conflict:
+      description: Already exists, in use, node offline, or wrong state.
+      content:
+        application/problem+json:
+          schema: {$ref: "#/components/schemas/Problem"}
+          example: {type: "https://ogm.dev/errors/conflict", title: conflict, status: 409, detail: "container group llama already exists"}
+    PreconditionFailed:
+      description: "`If-Match` / `If-None-Match` precondition failed."
+      content:
+        application/problem+json:
+          schema: {$ref: "#/components/schemas/Problem"}
+          example: {type: "https://ogm.dev/errors/precondition_failed", title: precondition failed, status: 412, detail: "version does not match (current 4)"}
+    RegistryError:
+      description: OCI registry error.
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/RegistryErrors"}
+          example: {errors: [{code: MANIFEST_UNKNOWN, message: "default/myapp:2.0"}]}
+    S3Error:
+      description: S3 XML error.
+      content:
+        application/xml:
+          schema: {type: string}
+          example: "<Error><Code>NoSuchBucket</Code><Message>the specified bucket does not exist</Message><RequestId>…</RequestId></Error>"
+    S3XML:
+      description: S3 XML result.
+      content:
+        application/xml:
+          schema: {type: string}
+  schemas:
+    # ---------------------------------------------------------------- common
+    Problem:
+      type: object
+      description: RFC 7807 problem details.
+      required: [title, status]
+      properties:
+        type: {type: string, format: uri, description: "`https://ogm.dev/errors/{slug}`.", example: "https://ogm.dev/errors/not_found"}
+        title: {type: string, description: "Short, stable summary (e.g. `not found`, `validation failed`).", example: not found}
+        status: {type: integer, example: 404}
+        detail: {type: string, description: "Human-readable explanation.", example: container group not found}
+        errors:
+          type: object
+          description: Validation errors by field path (e.g. `container.resources.cpu`).
+          additionalProperties: {type: array, items: {type: string}}
+    Name:
+      type: string
+      description: DNS label.
+      pattern: "^[a-z][a-z0-9-]{0,61}[a-z0-9]$"
+      example: my-app
+    RegistryErrors:
+      type: object
+      properties:
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              code: {type: string}
+              message: {type: string}
+    JSONRPCRequest:
+      type: object
+      required: [jsonrpc, method]
+      properties:
+        jsonrpc: {type: string, const: "2.0"}
+        id: {oneOf: [{type: string}, {type: integer}]}
+        method: {type: string, examples: [initialize, tools/list, tools/call, resources/read, ping]}
+        params: {type: object, additionalProperties: true}
+    JSONRPCResponse:
+      type: object
+      properties:
+        jsonrpc: {type: string, const: "2.0"}
+        id: {oneOf: [{type: string}, {type: integer}]}
+        result: {type: object, additionalProperties: true}
+        error:
+          type: object
+          properties:
+            code: {type: integer}
+            message: {type: string}
+            data: {}
+    # ---------------------------------------------------------------- container groups
+    ContainerGroupSpec:
+      type: object
+      description: |
+        The user-editable definition of a container group (what `ogm deploy` sends). See
+        `docs/spec-reference.md` for which fields update live and which trigger a rolling update.
+      required: [container]
+      properties:
+        name: {$ref: "#/components/schemas/Name"}
+        display_name: {type: string, description: "Shown in the dashboard. Defaults to `name`."}
+        project: {type: string, readOnly: true, description: "Set from the URL."}
+        replicas: {type: integer, minimum: 0, maximum: 1000, description: "Desired replicas. Ignored while an autoscaler or scheduled scaling controls the count."}
+        priority:
+          type: string
+          enum: [high, medium, low, batch]
+          default: medium
+          description: Higher priorities preempt lower ones (with a termination notice). Also the price multiplier 1.5 / 1.0 / 0.75 / 0.5.
+        restart_policy:
+          type: string
+          enum: [always, on_failure, never]
+          default: always
+          description: With `on_failure`/`never` an exited container is completed and not replaced; the group ends `succeeded` when all replicas complete.
+        autostart_policy: {type: boolean, default: true, description: "`false` creates the group stopped."}
+        country_codes: {type: array, items: {type: string, minLength: 2, maxLength: 2}, description: "ISO 3166-1 alpha-2 codes; only nodes in these countries.", example: [de, nl]}
+        node_selector:
+          type: object
+          additionalProperties: {type: string}
+          description: Node labels to match (agent `--label k=v`). Built-in keys `arch` and `os`.
+          example: {arch: amd64}
+        container: {$ref: "#/components/schemas/ContainerSpec"}
+        networking: {$ref: "#/components/schemas/Networking"}
+        startup_probe: {$ref: "#/components/schemas/Probe"}
+        readiness_probe: {$ref: "#/components/schemas/Probe"}
+        liveness_probe: {$ref: "#/components/schemas/Probe"}
+        queue_connection: {$ref: "#/components/schemas/QueueConnection"}
+        queue_autoscaler: {$ref: "#/components/schemas/QueueAutoscaler"}
+        http_autoscaler: {$ref: "#/components/schemas/HTTPAutoscaler"}
+        scaling_actions:
+          type: array
+          items: {$ref: "#/components/schemas/ScalingAction"}
+          description: Cron-scheduled replica counts; the most recent action wins. Needs `scheduled_scaling_enabled`.
+        scheduled_scaling_enabled: {type: boolean, default: false}
+        readme: {type: string, description: "Markdown shown in the dashboard."}
+    ContainerSpec:
+      type: object
+      required: [image]
+      properties:
+        image: {type: string, description: "Any registry, or `registry.ogm/{project}/{name}:{tag}` for the built-in registry.", example: "vllm/vllm-openai:v0.6.3"}
+        command: {type: array, items: {type: string}, description: "Replaces the image ENTRYPOINT and CMD."}
+        env:
+          type: object
+          additionalProperties: {type: string}
+          description: "Values may contain `{{secret:NAME}}`, `{{link:GROUP:PORT}}`, `{{link_host:GROUP:PORT}}` and `{{link_port:GROUP:PORT}}`."
+          example: {HF_TOKEN: "{{secret:HF_TOKEN}}", DB_URL: "postgres://app@{{link:postgres:5432}}/app"}
+        registry_auth: {$ref: "#/components/schemas/RegistryAuth"}
+        image_pull_policy:
+          type: string
+          enum: [always, if_not_present, never]
+          description: Default `always` for `:latest`/untagged images, else `if_not_present`.
+        resources: {$ref: "#/components/schemas/Resources"}
+        ports:
+          type: array
+          items: {type: integer, minimum: 1, maximum: 65535}
+          description: Extra ports other groups in the project may reach through links. Never public.
+        volumes:
+          type: array
+          items: {$ref: "#/components/schemas/Volume"}
+          description: Persistent per-replica volumes. A replica with volumes is pinned to the node holding its data.
+    Volume:
+      type: object
+      required: [name, mount]
+      properties:
+        name: {$ref: "#/components/schemas/Name"}
+        mount: {type: string, description: "Absolute mount path (not `/`).", example: /var/lib/postgresql/data}
+    RegistryAuth:
+      type: object
+      required: [username, password]
+      properties:
+        server: {type: string, example: ghcr.io}
+        username: {type: string}
+        password: {type: string, description: "Returned masked as `********`; sending the mask back keeps the stored password. May use `{{secret:NAME}}`."}
+    Resources:
+      type: object
+      properties:
+        cpu: {type: integer, minimum: 1, maximum: 256, default: 1, description: "vCPUs (hard limit)."}
+        memory_mb: {type: integer, minimum: 128, maximum: 2097152, default: 1024, description: "Memory limit."}
+        gpu_classes: {type: array, items: {type: string}, description: "Any-of GPU class IDs (e.g. `rtx-4090`); implies `gpu_count` 1.", example: [rtx-4090, rtx-3090]}
+        min_vram_mb: {type: integer, minimum: 0, description: "Only GPUs with at least this much free VRAM; implies `gpu_count` 1."}
+        gpu_count: {type: integer, minimum: 0, maximum: 16, default: 0, description: "0 = CPU-only."}
+        storage_gb: {type: integer, minimum: 1, maximum: 4096, default: 10, description: "Free disk the node must have."}
+        shm_mb: {type: integer, default: 64, description: "Size of `/dev/shm`."}
+        gpu_shared: {type: boolean, default: false, description: "Share one GPU with other shared instances; requires `min_vram_mb` (the VRAM budget) and a single GPU."}
+    Networking:
+      type: object
+      description: Enables the gateway. All fields update live except `port` (rolling).
+      required: [port]
+      properties:
+        port: {type: integer, minimum: 1, maximum: 65535, description: "Container port to route to."}
+        auth: {type: boolean, default: false, description: "Require a member API key or the share token."}
+        load_balancer: {type: string, enum: [least_number_of_connections, round_robin], default: least_number_of_connections}
+        single_connection_limit: {type: boolean, default: false, description: "One request per instance at a time (same as `max_concurrency` 1)."}
+        max_concurrency: {type: integer, minimum: 0, maximum: 100000, default: 0, description: "Max in-flight requests per instance; extra requests wait. 0 = unlimited."}
+        custom_domains:
+          type: array
+          maxItems: 20
+          items: {type: string, format: hostname}
+          description: Hostnames (CNAME or A record to the hub) routed to this group, e.g. `api.example.com`. TLS certificates are obtained automatically when the hub runs with `--tls`.
+          example: [api.example.com]
+        client_request_timeout_ms: {type: integer, minimum: 1, maximum: 3600000, default: 100000, description: "Max wait for a free/ready instance (504 after)."}
+        server_response_timeout_ms: {type: integer, minimum: 1, maximum: 3600000, default: 100000, description: "Max time until the app sends headers (524 after). Streaming afterwards is unlimited."}
+    Probe:
+      type: object
+      description: |
+        A health check run by the agent next to the container. Exactly one of `http`, `tcp`,
+        `exec`. Defaults (period/timeout/success/failure): startup 3/10/2/15, readiness 1/1/1/3,
+        liveness 10/30/1/3.
+      properties:
+        http: {$ref: "#/components/schemas/HTTPProbe"}
+        tcp: {$ref: "#/components/schemas/TCPProbe"}
+        exec: {$ref: "#/components/schemas/ExecProbe"}
+        initial_delay_seconds: {type: integer, minimum: 0}
+        period_seconds: {type: integer, minimum: 0}
+        timeout_seconds: {type: integer, minimum: 0}
+        success_threshold: {type: integer, minimum: 0}
+        failure_threshold: {type: integer, minimum: 0}
+      example: {http: {path: /health, port: 8000}, period_seconds: 10, failure_threshold: 120}
+    HTTPProbe:
+      type: object
+      description: GET; 2xx/3xx is success.
+      required: [path, port]
+      properties:
+        path: {type: string, example: /health}
+        port: {type: integer}
+        scheme: {type: string, enum: [http, https], default: http}
+        headers: {type: object, additionalProperties: {type: string}}
+    TCPProbe:
+      type: object
+      required: [port]
+      properties:
+        port: {type: integer}
+    ExecProbe:
+      type: object
+      required: [command]
+      properties:
+        command: {type: array, items: {type: string}, example: [sh, -c, test -f /ready]}
+    QueueConnection:
+      type: object
+      description: Attaches the group to a job queue. Update live.
+      required: [queue_name, port]
+      properties:
+        queue_name: {$ref: "#/components/schemas/Name"}
+        port: {type: integer, minimum: 1, maximum: 65535, description: "Container port jobs are POSTed to."}
+        path: {type: string, default: /}
+        concurrency: {type: integer, minimum: 1, maximum: 256, default: 1, description: "Jobs in flight per instance."}
+    QueueAutoscaler:
+      type: object
+      description: Scales replicas from queue depth (SaladCloud-compatible). Requires `queue_connection`.
+      required: [min_replicas, max_replicas, desired_queue_length]
+      properties:
+        min_replicas: {type: integer, minimum: 0}
+        max_replicas: {type: integer, minimum: 1, maximum: 1000}
+        desired_queue_length: {type: integer, minimum: 1, default: 1, description: "Target pending+running jobs per replica."}
+        polling_period: {type: integer, minimum: 5, maximum: 1800, default: 30, description: "Seconds between evaluations."}
+        max_upscale_per_minute: {type: integer, default: 10}
+        max_downscale_per_minute: {type: integer, default: 10}
+    HTTPAutoscaler:
+      type: object
+      description: |
+        Scales a gateway-enabled group on concurrent requests ("serverless"). A request to a
+        group at zero replicas starts one and waits for it. Requires `networking`; not combinable
+        with `queue_autoscaler`.
+      required: [min_replicas, max_replicas]
+      properties:
+        min_replicas: {type: integer, minimum: 0}
+        max_replicas: {type: integer, minimum: 1, maximum: 1000}
+        target_concurrency: {type: integer, minimum: 1, maximum: 10000, default: 10, description: "In-flight requests per replica."}
+        stable_window_seconds: {type: integer, minimum: 6, maximum: 600, default: 60, description: "Averaging window."}
+        scale_down_delay_seconds: {type: integer, minimum: 1, maximum: 86400, default: 300, description: "Demand must stay low this long before scaling down."}
+    ScalingAction:
+      type: object
+      required: [schedule, replicas]
+      properties:
+        schedule: {type: string, description: "5-field cron (hub time zone).", example: "0 8 * * 1-5"}
+        replicas: {type: integer, minimum: 0, maximum: 1000}
+    ContainerGroup:
+      description: A deployed container group (spec plus live state).
+      allOf:
+        - $ref: "#/components/schemas/ContainerGroupSpec"
+        - type: object
+          required: [id, owner, version, current_state, desired_replicas, pending_change, create_time, update_time]
+          properties:
+            id: {type: string, example: cg_7h2k9}
+            owner: {type: string}
+            version: {type: integer, description: "Bumped by changes that need new containers (rolling update)."}
+            current_state: {$ref: "#/components/schemas/GroupState"}
+            desired_replicas: {type: integer, description: "What the reconciler is aiming for now (after autoscalers/schedules)."}
+            gateway_url: {type: string, format: uri, example: "https://gpu.example.com/gw/default/llama/"}
+            gateway_token: {type: string, description: "Share token (`ogmg_…`) for the gateway; present when `networking.auth` is on."}
+            pending_change: {type: boolean, description: "Some instances still run an older version."}
+            create_time: {type: string, format: date-time}
+            update_time: {type: string, format: date-time}
+            instances: {type: array, items: {$ref: "#/components/schemas/Instance"}, description: "Live instances (only on GET of one group)."}
+            queue_stats: {$ref: "#/components/schemas/QueueStats"}
+    GroupState:
+      type: object
+      required: [status, instance_status_counts]
+      properties:
+        status: {type: string, enum: [pending, deploying, running, stopped, failed, succeeded]}
+        description: {type: string, description: "Why it is waiting, e.g. `no node with a free GPU matching rtx-4090`."}
+        start_time: {type: string, format: date-time}
+        finish_time: {type: string, format: date-time}
+        instance_status_counts: {$ref: "#/components/schemas/InstanceStatusCount"}
+    InstanceStatusCount:
+      type: object
+      properties:
+        allocating_count: {type: integer}
+        downloading_count: {type: integer}
+        creating_count: {type: integer}
+        running_count: {type: integer}
+        ready_count: {type: integer}
+        stopping_count: {type: integer}
+    Instance:
+      type: object
+      required: [id, container_group, project, state, ready, started, deletion_cost, version, replica_index, metrics, create_time, update_time]
+      properties:
+        id: {type: string, example: inst_9x2q4}
+        container_group: {type: string}
+        project: {type: string}
+        node_id: {type: string}
+        node_name: {type: string}
+        gpu_name: {type: string, example: NVIDIA GeForce RTX 4090}
+        gpu_indexes: {type: array, items: {type: integer}}
+        country: {type: string}
+        state: {type: string, enum: [allocating, downloading, creating, running, stopping, terminated]}
+        ready: {type: boolean, description: "Passing readiness; receives traffic and jobs."}
+        started: {type: boolean, description: "Startup probe passed."}
+        deletion_cost: {type: integer}
+        version: {type: integer, description: "The group version this instance runs."}
+        replica_index: {type: integer}
+        exit_code: {type: integer}
+        message: {type: string, description: "Placement or error detail."}
+        pulling_progress: {type: number, description: "Image pull progress 0-1."}
+        metrics: {$ref: "#/components/schemas/InstanceMetrics"}
+        stop_reason: {type: string}
+        create_time: {type: string, format: date-time}
+        update_time: {type: string, format: date-time}
+        running_time: {type: string, format: date-time}
+    InstanceMetrics:
+      type: object
+      properties:
+        cpu_percent: {type: number}
+        memory_usage_mb: {type: number}
+        gpu_util_percent: {type: number}
+        gpu_memory_mb: {type: number}
+        gpu_temp_c: {type: number}
+        inflight_jobs: {type: integer}
+        inflight_gateway_requests: {type: integer}
+    # ---------------------------------------------------------------- nodes
+    GPU:
+      type: object
+      required: [index, name, vram_mb, util_percent, mem_used_mb, temp_c]
+      properties:
+        index: {type: integer}
+        uuid: {type: string}
+        name: {type: string, example: NVIDIA GeForce RTX 4090}
+        class: {type: string, example: rtx-4090}
+        vram_mb: {type: integer}
+        util_percent: {type: number}
+        mem_used_mb: {type: integer}
+        temp_c: {type: number}
+        unified_memory: {type: boolean, description: "VRAM is shared system RAM (GB10, Jetson)."}
+    Node:
+      type: object
+      required: [id, name, owner, status, paused, cpu, memory_mb, disk_gb, gpus, instances, uptime_ratio, create_time]
+      properties:
+        id: {type: string, example: node_4kq2}
+        name: {type: string}
+        owner: {type: string}
+        status: {type: string, enum: [online, offline, pending]}
+        paused: {type: boolean}
+        pause_reason: {type: string}
+        runtime: {type: string, description: "Container runtime (docker, sim)."}
+        version: {type: string}
+        os: {type: string}
+        arch: {type: string}
+        cpu: {type: integer}
+        memory_mb: {type: integer}
+        disk_gb: {type: integer}
+        gpus: {type: array, items: {$ref: "#/components/schemas/GPU"}}
+        country: {type: string}
+        labels: {type: object, additionalProperties: {type: string}}
+        allow_priorities: {type: array, items: {type: string}}
+        window: {type: string, description: "Availability window (agent `--window`)."}
+        instances: {type: integer}
+        last_seen: {type: string, format: date-time}
+        connected_since: {type: string, format: date-time}
+        uptime_ratio: {type: number, minimum: 0, maximum: 1}
+        create_time: {type: string, format: date-time}
+        assessment: {$ref: "#/components/schemas/Assessment"}
+    NodeToken:
+      type: object
+      properties:
+        node_id: {type: string}
+        name: {type: string}
+        token: {type: string, description: "`ogmn_…`, shown once."}
+        install_command: {type: string}
+    Assessment:
+      type: object
+      description: Onboarding audit of a machine (`ogm assess`).
+      properties:
+        time: {type: string, format: date-time}
+        version: {type: string}
+        duration_seconds: {type: number}
+        os: {type: string}
+        arch: {type: string}
+        kernel: {type: string}
+        environment: {type: string, enum: [wsl2, container, vm, ""]}
+        laptop: {type: boolean}
+        uptime_hours: {type: number}
+        cpu:
+          type: object
+          properties:
+            model: {type: string}
+            cores: {type: integer}
+            threads: {type: integer}
+            load1: {type: number}
+            single_thread_mbps: {type: number, description: "SHA-256 MB/s on one thread."}
+            multi_thread_mbps: {type: number}
+        memory:
+          type: object
+          properties:
+            total_mb: {type: integer}
+            available_mb: {type: integer}
+            swap_mb: {type: integer}
+        disks:
+          type: array
+          items:
+            type: object
+            properties:
+              path: {type: string}
+              role: {type: string, enum: [root, docker]}
+              total_gb: {type: integer}
+              free_gb: {type: integer}
+              write_mbps: {type: number}
+        gpus: {type: array, items: {$ref: "#/components/schemas/GPU"}}
+        gpu_driver: {type: string}
+        runtime:
+          type: object
+          properties:
+            docker: {type: string}
+            nvidia_runtime: {type: boolean}
+            gvisor: {type: boolean}
+            gvisor_gpu: {type: boolean}
+        network:
+          type: object
+          properties:
+            hub_rtt_ms: {type: number}
+            hub_down_mbps: {type: number}
+            hub_up_mbps: {type: number}
+            internet_down_mbps: {type: number}
+            internet_up_mbps: {type: number}
+            internet_rtt_ms: {type: number}
+            nat: {type: string, enum: [none, endpoint-independent, symmetric, udp-blocked, no-internet, unknown]}
+            ipv6: {type: boolean}
+        profiles: {type: array, items: {type: string}, description: "Owner usage profiles (gaming, cad, …)."}
+        detected_apps: {type: array, items: {type: string}}
+        tier: {type: string, enum: [anchor, compute, burst, unsuitable]}
+        tier_reasons: {type: array, items: {type: string}}
+        suggested:
+          type: object
+          description: Suggested `ogm agent` limits.
+          properties:
+            max_cpu: {type: integer}
+            max_memory_mb: {type: integer}
+            max_disk_gb: {type: integer}
+            max_gpus: {type: integer, description: "0 = all, -1 = none."}
+            pause_on_process: {type: array, items: {type: string}}
+            window: {type: string}
+            agent_flags: {type: string}
+        recommendations:
+          type: array
+          items:
+            type: object
+            properties:
+              level: {type: string, enum: [info, warn, error]}
+              topic: {type: string, enum: [cpu, memory, disk, gpu, network, runtime, usage]}
+              text: {type: string}
+        errors: {type: object, additionalProperties: {type: string}, description: "Checks that were skipped or failed."}
+    GPUClass:
+      type: object
+      properties:
+        id: {type: string, example: rtx-4090}
+        name: {type: string, example: RTX 4090}
+        vram_mb: {type: integer}
+        credits_per_hour: {type: number, description: "Base price (medium priority)."}
+        online: {type: integer}
+        free: {type: integer}
+        in_use: {type: integer}
+        is_high_demand: {type: boolean, description: "Online but none free."}
+        prices: {type: object, additionalProperties: {type: number}, description: "Credits per hour by priority.", example: {high: 1.5, medium: 1, low: 0.75, batch: 0.5}}
+    ClusterInfo:
+      type: object
+      properties:
+        name: {type: string}
+        version: {type: string}
+        nodes: {type: integer}
+        nodes_online: {type: integer}
+        gpus: {type: integer}
+        gpus_free: {type: integer}
+        users: {type: integer}
+        container_groups: {type: integer}
+        instances_running: {type: integer}
+        jobs_pending: {type: integer}
+        gateway_domain: {type: string}
+        public_url: {type: string}
+        total_vram_gb: {type: number}
+    # ---------------------------------------------------------------- queues & jobs
+    QueueSettings:
+      type: object
+      description: Retry and retention tuning. All optional.
+      properties:
+        max_attempts: {type: integer, minimum: 1, maximum: 20, default: 3}
+        retry_backoff_base_s: {type: integer, default: 2}
+        retry_backoff_max_s: {type: integer, default: 300}
+        job_timeout_s: {type: integer, default: 3600}
+        retry_on_4xx: {type: boolean, default: false}
+        max_output_bytes: {type: integer, default: 67108864}
+        retention_hours: {type: integer, default: 168, description: "How long finished jobs are kept."}
+    QueueStats:
+      type: object
+      properties:
+        pending: {type: integer}
+        running: {type: integer}
+        succeeded: {type: integer}
+        failed: {type: integer}
+        cancelled: {type: integer}
+    Queue:
+      type: object
+      properties:
+        id: {type: string}
+        name: {type: string}
+        project: {type: string}
+        display_name: {type: string}
+        description: {type: string}
+        settings: {$ref: "#/components/schemas/QueueSettings"}
+        stats: {$ref: "#/components/schemas/QueueStats"}
+        container_groups: {type: array, items: {type: string}, description: "Groups attached through `queue_connection`."}
+        create_time: {type: string, format: date-time}
+        update_time: {type: string, format: date-time}
+    JobPrototype:
+      type: object
+      description: A job to submit.
+      properties:
+        input: {description: "Any JSON; POSTed to the worker as the body. Defaults to `{}`."}
+        metadata: {description: "Any JSON, returned with the job and in webhooks."}
+        webhook: {type: string, format: uri, description: "Called when the job finishes."}
+        max_attempts: {type: integer, maximum: 20, description: "Overrides the queue setting."}
+        timeout_s: {type: integer, description: "Overrides the queue's `job_timeout_s`."}
+    JobEvent:
+      type: object
+      properties:
+        action: {type: string, examples: [created, started, succeeded, failed, retrying, cancelled]}
+        time: {type: string, format: date-time}
+        instance_id: {type: string}
+        attempt: {type: integer}
+        error: {type: string}
+    Job:
+      type: object
+      properties:
+        id: {type: string, example: job_7f3a9c}
+        queue: {type: string}
+        project: {type: string}
+        status: {type: string, enum: [pending, running, succeeded, failed, cancelled]}
+        input: {description: "The submitted input."}
+        output: {description: "The worker's JSON response (or `{\"text\": \"...\"}`)."}
+        metadata: {}
+        webhook: {type: string}
+        attempts: {type: integer}
+        max_attempts: {type: integer}
+        timeout_s: {type: integer}
+        error: {type: string}
+        instance_id: {type: string, description: "Instance running it (while running)."}
+        next_attempt_at: {type: string, format: date-time, description: "When a pending retry becomes eligible."}
+        events: {type: array, items: {$ref: "#/components/schemas/JobEvent"}}
+        create_time: {type: string, format: date-time}
+        update_time: {type: string, format: date-time}
+    WebhookSecret:
+      type: object
+      properties:
+        secret_key: {type: string, description: "Base64 HMAC key (Standard Webhooks)."}
+    # ---------------------------------------------------------------- schedules
+    ScheduleSpec:
+      type: object
+      description: A cron schedule with exactly one action (`job`, `http` or `scale`).
+      required: [schedule]
+      properties:
+        name: {type: string, pattern: "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$", description: "Required on POST; taken from the URL on PUT."}
+        schedule: {type: string, description: "5-field cron in the hub's time zone.", example: "*/5 * * * *"}
+        enabled: {type: boolean, default: true}
+        job:
+          type: object
+          required: [queue]
+          properties:
+            queue: {type: string}
+            input: {description: "Job input JSON."}
+            metadata: {type: object, additionalProperties: {type: string}}
+        http:
+          type: object
+          required: [group]
+          properties:
+            group: {type: string}
+            method: {type: string, default: POST}
+            path: {type: string, default: /}
+            body: {type: string}
+            headers: {type: object, additionalProperties: {type: string}}
+        scale:
+          type: object
+          required: [group, replicas]
+          properties:
+            group: {type: string}
+            replicas: {type: integer, minimum: 0, maximum: 1000}
+        comment: {type: string}
+    Schedule:
+      allOf:
+        - $ref: "#/components/schemas/ScheduleSpec"
+        - type: object
+          properties:
+            project: {type: string}
+            next_run_time: {type: string, format: date-time, description: "Absent when disabled."}
+            last_run_time: {type: string, format: date-time}
+            last_status: {type: string, example: "ok: job job_7f3a9c"}
+            runs: {type: integer}
+            create_time: {type: string, format: date-time}
+            update_time: {type: string, format: date-time}
+    Quota:
+      type: object
+      description: Per-project limits. 0 = unlimited.
+      properties:
+        cpu: {type: integer, minimum: 0, description: "vCPUs, summed over all groups at peak replicas."}
+        memory_mb: {type: integer, minimum: 0}
+        gpus: {type: integer, minimum: 0}
+        instances: {type: integer, minimum: 0}
+        storage_mb: {type: integer, minimum: 0, description: "Megabytes of files, snapshots and S3 objects."}
+    QuotaUsage:
+      type: object
+      properties:
+        cpu: {type: integer}
+        memory_mb: {type: integer}
+        gpus: {type: integer}
+        instances: {type: integer}
+        storage_bytes: {type: integer}
+    QuotaStatus:
+      type: object
+      properties:
+        project: {type: string}
+        limits: {$ref: "#/components/schemas/Quota"}
+        usage: {$ref: "#/components/schemas/QuotaUsage"}
+        update_time: {type: string, format: date-time, description: When the quota was last set (absent if never).}
+    # ---------------------------------------------------------------- storage
+    Secret:
+      type: object
+      description: A project secret (the value is never returned).
+      properties:
+        name: {type: string}
+        create_time: {type: string, format: date-time}
+        update_time: {type: string, format: date-time}
+    VolumeInfo:
+      type: object
+      properties:
+        group: {type: string}
+        replica: {type: integer}
+        node_id: {type: string}
+        node_name: {type: string}
+        volumes: {type: array, items: {type: string}}
+        in_use: {type: boolean, description: "A live instance of this replica exists."}
+    Snapshot:
+      type: object
+      properties:
+        id: {type: string, example: snap_5d1e8a}
+        name: {type: string}
+        group: {type: string}
+        replica: {type: integer}
+        volumes: {type: array, items: {type: string}}
+        node_id: {type: string, description: "Node the snapshot was taken on."}
+        status: {type: string, enum: [pending, ready, failed]}
+        bytes: {type: integer}
+        error: {type: string}
+        restore_status: {type: string, description: "`restoring`, `restored` or `failed: …` (last restore)."}
+        create_time: {type: string, format: date-time}
+        finish_time: {type: string, format: date-time}
+    KVTable:
+      type: object
+      properties:
+        name: {type: string}
+        keys: {type: integer}
+        bytes: {type: integer}
+    KVItem:
+      type: object
+      properties:
+        key: {type: string}
+        version: {type: integer}
+        size: {type: integer}
+        value: {type: string, description: "Only with `values=1`."}
+        expire_time: {type: string, format: date-time}
+        update_time: {type: string, format: date-time}
+    KVKeyPage:
+      type: object
+      required: [items, next_after]
+      properties:
+        items: {type: array, items: {$ref: "#/components/schemas/KVItem"}}
+        next_after: {type: string, description: "Pass as `after` for the next page; empty when done."}
+    FileInfo:
+      type: object
+      properties:
+        path: {type: string}
+        size: {type: integer}
+        sha256: {type: string}
+        content_type: {type: string}
+        create_time: {type: string, format: date-time}
+    SignedURL:
+      type: object
+      properties:
+        url: {type: string, format: uri, example: "https://gpu.example.com/v1/signed/default/datasets/train.parquet?method=GET&exp=1762200000&sig=3f9a..."}
+        expires: {type: string, format: date-time}
+        method: {type: string, enum: [GET, PUT]}
+    S3Credential:
+      type: object
+      properties:
+        access_key_id: {type: string, example: OGMS3EXAMPLEKEYID000}
+        secret_access_key: {type: string, description: "Only in the create response."}
+        endpoint: {type: string, format: uri}
+        region: {type: string, example: us-east-1}
+        project: {type: string}
+        user: {type: string}
+        create_time: {type: string, format: date-time}
+        last_used: {type: string, format: date-time}
+    # ---------------------------------------------------------------- identity
+    User:
+      type: object
+      properties:
+        id: {type: string}
+        name: {type: string}
+        role: {type: string, enum: [admin, member]}
+        credits: {type: number}
+        create_time: {type: string, format: date-time}
+        api_key: {type: string, description: "Personal key (`ogm_…`); only when created or rotated."}
+        nodes: {type: integer}
+        contributed_credits: {type: number}
+        consumed_credits: {type: number}
+        credential:
+          $ref: '#/components/schemas/Credential'
+          description: "Only on `GET /v1/me`: the credential used for this request and its scope."
+    Credential:
+      type: object
+      description: The kind and scope of the credential behind a request.
+      properties:
+        type: {type: string, enum: [user_key, api_key, instance]}
+        key_id: {type: string, description: "Scoped API key id (`api_key` only)."}
+        project: {type: string, description: "Project the credential is limited to; absent = every project the user can access."}
+        role: {type: string, description: "admin, developer, viewer or instance for scoped credentials; the user's role for a personal key."}
+        group: {type: string, description: "Instance identities: the calling container group."}
+    LedgerEntry:
+      type: object
+      properties:
+        id: {type: integer}
+        user: {type: string}
+        delta: {type: number}
+        reason: {type: string, examples: [contribution, usage, grant, starter]}
+        ref: {type: string}
+        time: {type: string, format: date-time}
+    Invite:
+      type: object
+      properties:
+        code: {type: string}
+        role: {type: string, enum: [member, admin]}
+        uses_left: {type: integer}
+        expires: {type: string, format: date-time}
+        join_command: {type: string}
+    Project:
+      type: object
+      properties:
+        name: {type: string}
+        owner: {type: string}
+        members: {type: array, items: {type: string}}
+        create_time: {type: string, format: date-time}
+    APIKey:
+      type: object
+      properties:
+        id: {type: string}
+        name: {type: string}
+        project: {type: string, description: "Empty = all your projects."}
+        role: {type: string, enum: [admin, developer, viewer]}
+        user: {type: string}
+        expire_time: {type: string, format: date-time}
+        create_time: {type: string, format: date-time}
+        last_used_time: {type: string, format: date-time}
+        key: {type: string, description: "The secret `ogmk_…`; only in the create response."}
+    # ---------------------------------------------------------------- logs, events, metrics
+    Event:
+      type: object
+      properties:
+        id: {type: integer}
+        project: {type: string}
+        container_group: {type: string}
+        instance_id: {type: string}
+        node_id: {type: string}
+        kind: {type: string, example: group.updated}
+        message: {type: string, example: Container Group Updated (Version 3)}
+        time: {type: string, format: date-time}
+    LogEntry:
+      type: object
+      properties:
+        id: {type: integer}
+        project: {type: string}
+        container_group: {type: string}
+        instance_id: {type: string}
+        node_id: {type: string}
+        stream: {type: string, enum: [stdout, stderr]}
+        line: {type: string}
+        time: {type: string, format: date-time}
+    MetricPoint:
+      type: object
+      description: One minute of a group's series.
+      properties:
+        time: {type: string, format: date-time}
+        requests: {type: integer}
+        errors_4xx: {type: integer}
+        errors_5xx: {type: integer}
+        ready_replicas: {type: integer}
+        desired_replicas: {type: integer}
+        cpu_percent: {type: number}
+        memory_mb: {type: number}
+        gpu_util_percent: {type: number}
+        p50_ms: {type: number}
+        p95_ms: {type: number}
+        p99_ms: {type: number}
+    GroupMetrics:
+      type: object
+      properties:
+        group: {type: string}
+        minutes: {type: integer}
+        points: {type: array, items: {$ref: "#/components/schemas/MetricPoint"}}
+        summary:
+          type: object
+          properties:
+            requests: {type: integer}
+            errors_4xx: {type: integer}
+            errors_5xx: {type: integer}
+            p50_ms: {type: number}
+            p95_ms: {type: number}
+            p99_ms: {type: number}
+    # ---------------------------------------------------------------- list wrappers
+    ContainerGroupList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: "#/components/schemas/ContainerGroup"}}}}
+    InstanceList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: "#/components/schemas/Instance"}}}}
+    NodeList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: "#/components/schemas/Node"}}}}
+    GPUClassList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: "#/components/schemas/GPUClass"}}}}
+    QueueList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: "#/components/schemas/Queue"}}}}
+    JobList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: "#/components/schemas/Job"}}}}
+    ScheduleList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: "#/components/schemas/Schedule"}}}}
+    SecretList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: "#/components/schemas/Secret"}}}}
+    VolumeInfoList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: "#/components/schemas/VolumeInfo"}}}}
+    SnapshotList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: "#/components/schemas/Snapshot"}}}}
+    KVTableList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: "#/components/schemas/KVTable"}}}}
+    FileInfoList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: "#/components/schemas/FileInfo"}}}}
+    S3CredentialList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: "#/components/schemas/S3Credential"}}}}
+    UserList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: "#/components/schemas/User"}}}}
+    LedgerEntryList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: "#/components/schemas/LedgerEntry"}}}}
+    ProjectList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: "#/components/schemas/Project"}}}}
+    APIKeyList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: "#/components/schemas/APIKey"}}}}
+    EventList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: "#/components/schemas/Event"}}}}
+    LogEntryList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: "#/components/schemas/LogEntry"}}}}

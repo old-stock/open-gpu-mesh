@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/old-stock/open-gpu-mesh/internal/api"
+	"github.com/old-stock/open-gpu-mesh/internal/assess"
 	"github.com/old-stock/open-gpu-mesh/internal/client"
 )
 
@@ -132,18 +133,22 @@ func cmdNodes(e *env) {
 		for _, g := range n.GPUs {
 			gpus = append(gpus, fmt.Sprintf("%s(%dG)", g.Name, g.VRAMMB/1024))
 		}
+		tier := "-"
+		if n.Assessment != nil {
+			tier = n.Assessment.Tier
+		}
 		status := n.Status
 		if n.Paused {
 			status += " (paused)"
 		}
 		rows = append(rows, []string{n.ID, n.Name, n.Owner, status, orDash(strings.Join(gpus, ",")), strconv.Itoa(n.CPU),
-			strconv.Itoa(n.MemoryMB / 1024), orDash(n.Country), strconv.Itoa(n.Instances), fmt.Sprintf("%.0f%%", n.UptimeRatio*100), ago(n.LastSeen)})
+			strconv.Itoa(n.MemoryMB / 1024), orDash(n.Country), strconv.Itoa(n.Instances), fmt.Sprintf("%.0f%%", n.UptimeRatio*100), tier, ago(n.LastSeen)})
 	}
-	e.table("ID\tNAME\tOWNER\tSTATUS\tGPUS\tCPU\tRAM(G)\tCOUNTRY\tINST\tUPTIME\tSEEN", rows)
+	e.table("ID\tNAME\tOWNER\tSTATUS\tGPUS\tCPU\tRAM(G)\tCOUNTRY\tINST\tUPTIME\tTIER\tSEEN", rows)
 }
 
 func cmdNode(e *env, args []string) {
-	need(args, 1, "node add|pause|resume|rm ...")
+	need(args, 1, "node add|pause|resume|rm|assessment ...")
 	c := e.client()
 	switch args[0] {
 	case "add":
@@ -165,12 +170,22 @@ func cmdNode(e *env, args []string) {
 		need(args, 2, "node "+args[0]+" NODE_ID")
 		check(c.Do(e.ctx, "PATCH", "/v1/nodes/"+args[1], map[string]bool{"paused": args[0] == "pause"}, nil))
 		fmt.Fprintf(e.out, "node %s %sd\n", args[1], args[0])
+	case "assessment", "audit":
+		need(args, 2, "node assessment NODE_ID")
+		var a api.Assessment
+		check(c.Do(e.ctx, "GET", "/v1/nodes/"+args[1]+"/assessment", nil, &a))
+		if e.output == "json" {
+			e.json(a)
+			return
+		}
+		fmt.Fprintf(e.out, "Assessed %s (ogm %s, %.0fs)\n", a.Time.Local().Format("Jan 02 15:04"), a.Version, a.DurationSec)
+		assess.Render(e.out, &a)
 	case "rm", "delete":
 		need(args, 2, "node rm NODE_ID")
 		check(c.Do(e.ctx, "DELETE", "/v1/nodes/"+args[1], nil, nil))
 		fmt.Fprintf(e.out, "node %s removed\n", args[1])
 	default:
-		fatalf("usage: ogm node add|pause|resume|rm")
+		fatalf("usage: ogm node add|pause|resume|rm|assessment")
 	}
 }
 

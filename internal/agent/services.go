@@ -108,7 +108,7 @@ func (a *Agent) handleIMDS(w http.ResponseWriter, r *http.Request) {
 		in.set(func() { in.deletionCost = *body.DeletionCost })
 		ok(map[string]int{"deletion_cost": *body.DeletionCost})
 	case op == "token" && r.Method == http.MethodGet:
-		if rep, good := forward(proto.IMDSRequest{InstanceID: id, Op: proto.IMDSToken}); good {
+		if rep, good := forward(proto.IMDSRequest{InstanceID: id, Op: proto.IMDSToken, Audience: r.URL.Query().Get("audience")}); good {
 			ok(map[string]string{"jwt": rep.JWT})
 		}
 	case op == "metadata" && r.Method == http.MethodGet:

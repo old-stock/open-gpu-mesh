@@ -138,8 +138,12 @@ func (i *instance) run(ctx context.Context) {
 				return
 			}
 		}
+		links, err := i.openLinks(ctx, spec)
+		if err != nil {
+			i.terminate(nil, "links: "+err.Error(), "Instance Failed (link listener: "+truncate(err.Error(), 200)+")")
+			return
+		}
 		var ctr Container
-		var err error
 		if adopted != nil {
 			ctr, adopted = adopted, nil
 			i.a.log.Info("re-attached to running container", "id", spec.ID)
@@ -147,9 +151,10 @@ func (i *instance) run(ctx context.Context) {
 		} else {
 			i.set(func() { i.state = api.InstCreating; i.pullProgress = 100 })
 			i.report("")
-			ctr, err = i.a.rt.Create(ctx, i.startSpec(spec))
+			ctr, err = i.a.rt.Create(ctx, i.startSpec(spec, links))
 		}
 		if err != nil {
+			links.close()
 			if ctx.Err() != nil {
 				return
 			}
@@ -197,6 +202,7 @@ func (i *instance) run(ctx context.Context) {
 			}
 			if spec.RestartPolicy == "never" || (spec.RestartPolicy == "on_failure" && code == 0) {
 				rcancel()
+				links.close()
 				_ = ctr.Remove(context.Background())
 				i.terminate(&c, "exited", ev)
 				return
@@ -218,6 +224,7 @@ func (i *instance) run(ctx context.Context) {
 			next = "shutdown"
 		}
 		rcancel()
+		links.close()
 		if next == "shutdown" && i.a.Detached() {
 			return // leave the container running for the next agent process to adopt
 		}
@@ -282,10 +289,10 @@ func (i *instance) snapshotSpec() proto.InstanceSpec {
 	return i.spec
 }
 
-func (i *instance) startSpec(spec proto.InstanceSpec) StartSpec {
+func (i *instance) startSpec(spec proto.InstanceSpec, links *linkSet) StartSpec {
 	env := map[string]string{}
 	for k, v := range spec.Env {
-		env[k] = v
+		env[k] = links.expand(v)
 	}
 	env["OGM_IMDS_URL"] = i.a.imdsURL(spec.IMDSSecret)
 	if g := i.a.gpuNames(spec.GPUIndexes); g != "" {
@@ -294,7 +301,7 @@ func (i *instance) startSpec(spec proto.InstanceSpec) StartSpec {
 	env["OGM_NODE_COUNTRY"] = i.a.cfg.Country
 	return StartSpec{
 		Name: spec.ID, Image: spec.Image, Command: spec.Command, Env: env, Resources: spec.Resources,
-		GPUIndexes: spec.GPUIndexes, Ports: spec.Ports,
+		GPUIndexes: spec.GPUIndexes, Ports: spec.Ports, Volumes: spec.Volumes,
 		Labels: map[string]string{"dev.ogm.instance": spec.ID, "dev.ogm.group": spec.Group, "dev.ogm.project": spec.Project,
 			"dev.ogm.version": strconv.Itoa(spec.Version)},
 	}

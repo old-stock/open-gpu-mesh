@@ -45,3 +45,11 @@ func TestJWT(t *testing.T) {
 		t.Fatal("expired token accepted")
 	}
 }
+
+func TestJWTRequiresExp(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	tok, _ := SignJWT(priv, "k", map[string]any{"sub": "x"})
+	if _, err := VerifyJWT(pub, tok); err == nil {
+		t.Fatal("token without exp accepted")
+	}
+}

@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS nodes (
   admin_paused INTEGER NOT NULL DEFAULT 0,
   info TEXT NOT NULL DEFAULT '{}', last_seen INTEGER, connected_since INTEGER,
   online_seconds INTEGER NOT NULL DEFAULT 0, tracked_seconds INTEGER NOT NULL DEFAULT 0, created INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS node_assessments (node_id TEXT PRIMARY KEY, data TEXT NOT NULL, time INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS gpu_classes (id TEXT PRIMARY KEY, name TEXT NOT NULL, vram_mb INTEGER NOT NULL, credits_per_hour REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS container_groups (
   id TEXT PRIMARY KEY, project TEXT NOT NULL, name TEXT NOT NULL, owner_id TEXT NOT NULL,

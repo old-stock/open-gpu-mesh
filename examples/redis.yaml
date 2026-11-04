@@ -1,0 +1,19 @@
+# Redis with append-only persistence and a password.
+#   ogm secret set redis-password
+#   ogm deploy -f examples/redis.yaml
+# Clients use REDIS_URL: redis://:{{secret:redis-password}}@{{link:redis:6379}}
+name: redis
+replicas: 1
+priority: high
+container:
+  image: redis:7-alpine
+  command: ["sh", "-c", "exec redis-server --appendonly yes --requirepass \"$REDIS_PASSWORD\""]
+  env:
+    REDIS_PASSWORD: "{{secret:redis-password}}"
+  ports: [6379]
+  volumes:
+    - { name: data, mount: /data }
+  resources: { cpu: 1, memory_mb: 512 }
+readiness_probe:
+  tcp: { port: 6379 }
+  period_seconds: 5

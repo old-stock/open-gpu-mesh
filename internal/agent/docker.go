@@ -65,6 +65,57 @@ func (d *DockerRuntime) Name() string { return "docker" }
 // IMDSHost implements Runtime.
 func (d *DockerRuntime) IMDSHost() string { return "host.docker.internal" }
 
+// LinkHost implements LinkHoster: link listeners bind to the default bridge gateway (what
+// host.docker.internal resolves to on Linux) so only local containers reach them. Docker
+// Desktop runs containers in a VM whose host.docker.internal reaches the host's loopback.
+func (d *DockerRuntime) LinkHost(ctx context.Context) (string, string) {
+	resp, err := d.do(ctx, http.MethodGet, "/networks/bridge", nil, nil)
+	if err == nil {
+		var nw struct {
+			IPAM struct {
+				Config []struct{ Gateway string }
+			}
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&nw)
+		resp.Body.Close()
+		for _, c := range nw.IPAM.Config {
+			if ip := net.ParseIP(c.Gateway); ip != nil && localIP(ip) {
+				return c.Gateway, "host.docker.internal"
+			}
+		}
+	}
+	return "127.0.0.1", "host.docker.internal"
+}
+
+func localIP(ip net.IP) bool {
+	addrs, _ := net.InterfaceAddrs()
+	for _, a := range addrs {
+		if n, ok := a.(*net.IPNet); ok && n.IP.Equal(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// RemoveVolumes implements VolumeRemover. Only volumes created by ogm are removed.
+func (d *DockerRuntime) RemoveVolumes(ctx context.Context, names []string) error {
+	for _, n := range names {
+		if !strings.HasPrefix(n, "ogm-vol-") {
+			continue
+		}
+		resp, err := d.do(ctx, http.MethodDelete, "/volumes/"+url.PathEscape(n), nil, nil)
+		var de *dockerError
+		if errors.As(err, &de) && de.Status == http.StatusNotFound {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		resp.Body.Close()
+	}
+	return nil
+}
+
 func (d *DockerRuntime) do(ctx context.Context, method, path string, body any, hdr http.Header) (*http.Response, error) {
 	d.init()
 	var rd io.Reader
@@ -317,6 +368,14 @@ func (d *DockerRuntime) Create(ctx context.Context, spec StartSpec) (Container, 
 	if d.OCIRuntime != "" {
 		hostCfg["Runtime"] = d.OCIRuntime
 	}
+	if len(spec.Volumes) > 0 {
+		var mounts []map[string]any
+		for _, v := range spec.Volumes {
+			mounts = append(mounts, map[string]any{"Type": "volume", "Source": v.Source, "Target": v.Target,
+				"VolumeOptions": map[string]any{"Labels": map[string]string{dockerLabel: "1", "dev.ogm.volume": v.Name}}})
+		}
+		hostCfg["Mounts"] = mounts
+	}
 	if len(spec.GPUIndexes) > 0 {
 		ids := make([]string, len(spec.GPUIndexes))
 		for i, g := range spec.GPUIndexes {
@@ -426,6 +485,39 @@ type dockerContainer struct {
 }
 
 func (c *dockerContainer) ID() string { return c.id }
+
+// IPs implements AddrLister: the container's addresses on its Docker networks.
+func (c *dockerContainer) IPs(ctx context.Context) []string {
+	resp, err := c.d.do(ctx, http.MethodGet, "/containers/"+c.id+"/json", nil, nil)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	var info struct {
+		NetworkSettings struct {
+			IPAddress string
+			Networks  map[string]struct {
+				IPAddress         string
+				GlobalIPv6Address string
+			}
+		}
+	}
+	if json.NewDecoder(resp.Body).Decode(&info) != nil {
+		return nil
+	}
+	out := []string{}
+	if a := info.NetworkSettings.IPAddress; a != "" {
+		out = append(out, a)
+	}
+	for _, n := range info.NetworkSettings.Networks {
+		for _, a := range []string{n.IPAddress, n.GlobalIPv6Address} {
+			if a != "" {
+				out = append(out, a)
+			}
+		}
+	}
+	return out
+}
 
 func (c *dockerContainer) HostAddr(port int) string {
 	if a, ok := c.ports[port]; ok {

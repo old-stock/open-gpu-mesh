@@ -1,6 +1,6 @@
 # Spec reference
 
-`ogm deploy -f FILE` accepts YAML or JSON. A file can hold several documents separated by `---`. The deploy command expands `${ENV_VAR}` from your shell. A document with `kind: queue` defines a queue. Any other document is a container group. Deploying is an upsert: the same name updates the existing group or queue in place.
+`ogm deploy -f FILE` accepts YAML or JSON. A file can hold several documents separated by `---`. The deploy command expands `${ENV_VAR}` (braced form only) from your shell; bare `$VAR`, `$(...)` and `$((...))` in commands pass through untouched, and `$${X}` gives a literal `${X}`. A document with `kind: queue` defines a queue, and one with `kind: schedule` defines a [schedule](services.md#schedules). Any other document is a container group. Deploying is an upsert: the same name updates the existing group or queue in place.
 
 ## Container group
 
@@ -18,7 +18,9 @@
 | `container.image` | string | required | rolling | Any registry, or `registry.ogm/{project}/{name}:{tag}` for the [built-in registry](#built-in-image-registry) |
 | `container.image_pull_policy` | `always` \| `if_not_present` \| `never` | `always` for `:latest`/untagged, else `if_not_present` | rolling | If a pull fails but the image exists locally, the local copy is used (with an event) |
 | `container.command` | [string] | image default | rolling | replaces the image ENTRYPOINT+CMD |
-| `container.env` | map | | rolling | |
+| `container.env` | map | | rolling | Values may reference `{{secret:NAME}}` and `{{link:GROUP:PORT}}`; see [secrets](#secrets) and [links](#links-between-groups) |
+| `container.ports` | [int] | | rolling | Extra ports other groups may reach through `{{link:...}}` (the networking, queue and probe ports are always published) |
+| `container.volumes` | `[{name, mount}]` | | rolling | Persistent volumes; see [volumes](#persistent-volumes) |
 | `container.registry_auth` | `{server, username, password}` | | rolling | The API returns the password masked. Sending the masked value back keeps the stored password. |
 | `container.resources.cpu` | int | 1 | rolling | vCPUs (hard limit) |
 | `container.resources.memory_mb` | int | 1024 | rolling | hard limit |
@@ -31,12 +33,15 @@
 | `networking.port` | int | | rolling (port) / yes (rest) | Enables the gateway. |
 | `networking.auth` | bool | false | yes | Accepts a member API key or the group's share token, via `OGM-Api-Key`, `Authorization: Bearer`, or `?ogm_token=`. |
 | `networking.load_balancer` | `least_number_of_connections` \| `round_robin` | least | yes | |
-| `networking.single_connection_limit` | bool | false | yes | One request per instance at a time; the rest wait in a queue. |
+| `networking.single_connection_limit` | bool | false | yes | One request per instance at a time; the rest wait in a queue. Same as `max_concurrency: 1`. |
+| `networking.max_concurrency` | int 0–100000 | 0 (unlimited) | yes | Hard cap of requests in flight per instance; extra requests wait (up to `client_request_timeout_ms`) |
+| `networking.custom_domains` | [hostname] | | yes | Extra hostnames routed to this group (point their DNS at the hub). Each domain may belong to one group only. With `--tls` the hub gets certificates for them automatically. See [services](services.md#custom-domains-and-tls). |
 | `networking.client_request_timeout_ms` | int | 100000 | yes | max time a request may wait for a free or ready instance (504) |
 | `networking.server_response_timeout_ms` | int ≤ 3600000 | 100000 | yes | Time until the app sends response headers (524). Streaming after that point has no limit. |
 | `startup_probe`, `readiness_probe`, `liveness_probe` | probe | | rolling | see below |
 | `queue_connection` | `{queue_name, port, path, concurrency}` | | yes | `concurrency` = jobs in flight per instance (default 1) |
 | `queue_autoscaler` | see below | | yes | |
+| `http_autoscaler` | see below | | yes | Needs `networking`; not combined with `queue_autoscaler` |
 | `scaling_actions` | `[{schedule, replicas}]` | | yes | 5-field cron in the server's timezone. The most recent action sets `replicas`. |
 | `scheduled_scaling_enabled` | bool | false | yes | Must be `true` for `scaling_actions` to apply. It lets you pause a schedule without deleting it. |
 
@@ -86,6 +91,62 @@ queue_autoscaler:
 
 `target = clamp(ceil(queue_length / desired_queue_length), min, max)`, then limited to the up/down rate. This is the same formula SaladCloud uses, so existing configs carry over.
 
+### HTTP autoscaler
+
+Scales on gateway traffic, including from zero: a request to a group with no instances raises the replica count to 1 and waits (up to `client_request_timeout_ms`) for the instance to become ready.
+
+```yaml
+http_autoscaler:
+  min_replicas: 0               # 0 = scale to zero when idle
+  max_replicas: 10
+  target_concurrency: 10        # requests in flight (plus queued) per replica (default 10)
+  stable_window_seconds: 60     # averaging window, 6-600 (default 60)
+  scale_down_delay_seconds: 300 # demand must stay lower this long before scaling down (default 300)
+```
+
+Demand is sampled every second. `want = clamp(max(ceil(avg_window / target), ceil(avg_last_6s / target)), min, max)`. The 6-second term reacts to bursts. Scale-up is immediate; scale-down waits for `scale_down_delay_seconds`. While this is set, `replicas` is managed by the autoscaler.
+
+### Secrets
+
+```sh
+ogm secret set pg-password          # prompts; or: ogm secret set NAME VALUE | --from-file F
+ogm secret ls                       # names and dates only; values can't be read back
+```
+
+Reference a secret in any `container.env` value or in `container.registry_auth.password` as `{{secret:NAME}}`. Values are encrypted at rest (AES-256-GCM, key in `secrets.key` next to the database, so a copy of the database alone reveals nothing) and expanded only when an instance is started on a node. If a referenced secret doesn't exist, the instance waits with a message instead of starting; changing a secret applies to instances started afterwards (use `ogm recreate` to roll it out).
+
+The node owner can still see a running container's environment. See the trust model in the README.
+
+### Links between groups
+
+```yaml
+env:
+  DATABASE_URL: postgres://app:{{secret:pg-password}}@{{link:postgres:5432}}/app
+  REDIS_HOST: "{{link_host:redis:6379}}"
+  REDIS_PORT: "{{link_port:redis:6379}}"
+```
+
+`{{link:GROUP:PORT}}` becomes a `host:port` address local to the instance's node. Connections to it are relayed through the hub to a ready instance of `GROUP` in the same project, wherever it runs, over the agents' existing outbound tunnels: no VPN, port forwarding or public IP. The target group must publish the port (`container.ports`, its networking port or its queue port). Only links declared in a group's own env are allowed. If the target has no ready instance yet, a connection waits up to 90 s; a target with an `http_autoscaler` is woken from zero.
+
+Traffic goes through the hub, so for large transfers put the groups near the hub or use the file store.
+
+### Persistent volumes
+
+```yaml
+container:
+  volumes:
+    - { name: data, mount: /var/lib/postgresql/data }
+```
+
+Each replica gets its own volume per entry (Docker named volume `ogm-vol-{project}_{group}_{name}_{replica}`). The first time a replica runs, it is pinned to that node; later instances of that replica (restarts, updates, stop/start) always go back to the same node and see the same data. If the node is offline, the replica waits for it rather than starting empty elsewhere. Deleting the group keeps the volumes, and redeploying the same name reuses them.
+
+```sh
+ogm volumes                         # group, replica, node, in use
+ogm volumes rm GROUP [--replica N]  # delete the data (group must be stopped/removed, node online)
+```
+
+Volumes live on one volunteer's disk with no replication: keep backups of anything you can't lose. With the process runtime (dev only), volumes are directories exported as `$OGM_VOLUME_<NAME>`.
+
 ### Environment inside every container
 
 | Variable | |
@@ -104,6 +165,8 @@ Every cluster includes an OCI registry, so custom images need no Docker Hub or G
 docker build -t my-app:dev .
 ogm push my-app:dev                 # -> registry.ogm/{project}/my-app:dev
 ogm push --multiarch my-app:dev     # from x86 AND from ARM: the tag becomes a multi-platform image
+ogm push --platform linux/arm64 postgres:17-alpine   # add another platform of a local multi-platform image
+                                    # (Docker's containerd image store; pull it first with --platform)
 ogm images
 ```
 

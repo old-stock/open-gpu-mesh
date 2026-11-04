@@ -107,7 +107,11 @@ func VerifyJWT(pub ed25519.PublicKey, token string) (map[string]any, error) {
 	if err := json.Unmarshal(body, &claims); err != nil {
 		return nil, err
 	}
-	if exp, ok := claims["exp"].(float64); ok && time.Now().Unix() > int64(exp) {
+	exp, ok := claims["exp"].(float64)
+	if !ok {
+		return nil, errors.New("token has no exp")
+	}
+	if time.Now().Unix() > int64(exp) {
 		return nil, errors.New("token expired")
 	}
 	return claims, nil

@@ -47,9 +47,77 @@ The server listened on node A's LAN address. Agents used the Docker runtime with
 4. **Exclusive GPUs wasted capacity.** Added `gpu_shared` with VRAM budgets and per-slice billing.
 5. **No registry for custom images.** Added the built-in OCI registry, `ogm push [--multiarch]`, `ogm images`, `image_pull_policy` with local fallback, and arch-aware placement.
 
+## Onboarding audit (`ogm assess`)
+
+A second run audited three machines against a temporary hub on node A: node A, node B, and node C (a second GB10 whose Docker has no NVIDIA runtime).
+
+| | node A (RTX 3090) | node B (GB10) | node C (GB10, no NVIDIA runtime) |
+|---|---|---|---|
+| CPU | 16 cores / 32 threads | 10 cores / 20 threads | 10 cores / 20 threads |
+| Memory in use by owner | 9 of 62 GB | 113 of 119 GB (unified) | 114 of 119 GB (unified) |
+| Hub (LAN) | 0 ms | 941 / 941 Mbps | 941 / 944 Mbps |
+| Internet | 860 down / 40 up Mbps | none (no internet) | none (no internet) |
+| Suggested memory to share | 53 GB | 4.8 GB | 3.8 GB |
+| Tier | compute (upload < 50 Mbps) | compute (no internet) | compute (no internet) |
+| Flagged | 21 of 24 GB VRAM in use by owner | no internet access | missing NVIDIA Container Toolkit |
+
+Quick mode took about 25–35 seconds per machine. The first pass found three recommender bugs, fixed before the run above:
+- server/ML machines were offered memory their own models were using;
+- a machine with no internet was reported as "UDP blocked" and downgraded to burst;
+- LAN speed to the hub counted towards the anchor tier.
+
+## Neocloud services on a five-node fleet (2026-11-04)
+
+A third run tested every cluster service end to end on five Linux machines, using the automated live suite in [internal/e2e/live_test.go](../internal/e2e/live_test.go): `go test ./internal/e2e -run TestLive`, configured with `OGM_LIVE_*` variables. The owner's 3090 stayed reserved for other work, so its agent ran with `--no-gpu` and took only CPU, memory and storage jobs.
+
+| Node | Hardware | Runtime | Agent limits |
+|---|---|---|---|
+| node A | x86_64 storage server, 12 threads, 62 GB | Docker | 8 vCPU, 16 GB; also ran the hub |
+| node B | x86_64, 32 threads, 62 GB (RTX 3090 not offered) | Docker, `--no-gpu` | 8 vCPU, 8 GB |
+| node C | aarch64 GB10 (no GPU offered) | Docker, `--no-gpu` | 2 vCPU, 1.5 GB |
+| node D | aarch64 GB10 | Docker, 1 GPU | 2 vCPU, 1.5 GB |
+| node E | x86_64 laptop | process runtime (no Docker) | 4 vCPU, 4 GB |
+
+All 21 checks pass, and a second run straight afterwards, on the leftover state, passes too:
+
+| Check | Result |
+|---|---|
+| Fleet: 5 nodes, 3 amd64 + 2 arm64; audit tiers (untested internet → compute, laptop → burst) | ✅ |
+| Registry: `demo` and `postgres` tags hold amd64 + arm64 (arm64 added from an x86 host with `ogm push --platform`) | ✅ |
+| A container on every host, both runtimes: ready in ≤ 1 s, gateway round trip 5–12 ms | ✅ |
+| Lifecycle: logs, events, rolling update, restart, recreate, reallocate | ✅ |
+| Links: laptop (amd64, process) → hub → GB10 (arm64, Docker), about 10 ms per request | ✅ |
+| Postgres with a secret password and a volume; psql client on an arm64 node over a link; snapshot (6.7 MB in 2 s); migration to another node by restoring the snapshot, with data intact | ✅ |
+| HTTP autoscaler: cold start about 200 ms, 0 → 3 → 0 replicas across three nodes, 100/100 requests OK | ✅ |
+| Queue autoscaler: 24 jobs in 18 s, spread across all four Docker nodes on both architectures | ✅ |
+| `max_concurrency: 1` serializes requests | ✅ |
+| KV and instance identity: containers on two nodes incremented a shared counter with IMDS tokens and no API keys | ✅ |
+| Schedules: a cron scale-up fired on its own, and an HTTP action returned 200 | ✅ |
+| Files: 3 MB through a presigned URL in about 100 ms | ✅ |
+| S3 API: aws-sdk-go-v2 put/get of 8 MB, bucket create/delete | ✅ |
+| Scoped keys: a viewer key reads and cannot write | ✅ |
+| Metrics: per-minute p50/p95/p99 and Prometheus `/metrics` | ✅ |
+| Custom domain routed by the `Host` header | ✅ |
+| Quotas: a third replica over `cpu: 2` rejected; an upload over `storage_mb` rejected | ✅ |
+| MCP over HTTP: 58 tools, `tools/call` works | ✅ |
+| Docs: `/docs`, `/openapi.json`, `/llms.txt` | ✅ |
+| GPU container on the GB10 sees its GPU | ✅ |
+| Owner pause: the workload is ready on another node within a second | ✅ |
+
+What this run changed in ogm:
+
+1. **`replicas` defaulted to 0** when left out, although the docs said 1, so the Postgres and Redis templates would have started nothing. It now defaults to 1, through both the API and the CLI.
+2. **`ogm push` with Docker's containerd image store** pushed only the host platform. The new `--platform linux/arm64` flag pushes the other platform.
+3. **`?wait=30s`** (as documented) was silently ignored; only `?wait=30` worked. Both forms are accepted now, and the same goes for KV `?ttl=`.
+4. **Project-scoped keys** could not list their own project or the nodes, which left the dashboard blank. `/v1/me` now reports the credential's type, project and role.
+5. **The demo app's `/gpu`** failed in a `FROM scratch` image, because the injected `nvidia-smi` needs glibc. It now falls back to `/proc/driver/nvidia`.
+6. **Live-suite hygiene:** resources are cleaned up per subtest, so small nodes don't fill up. A stale Postgres volume with an old password is removed before the test starts.
+
 ## Known issues and follow-ups
 
 - **GB10 pricing.** The default credit price is based on VRAM, so unified memory makes the GB10 cost about 5 credits/h. Set it with `PATCH /v1/gpu-classes/gb10`. A better default for unified memory is needed.
 - **Heavy GPU work on the GB10 wasn't tested.** It had only about 6 GB of memory free next to the owner's model.
 - **Shared-GPU accounting is a scheduler budget, not a hard limit.** CUDA has no per-container VRAM cap without MIG/MPS, so a shared instance that overruns its budget can OOM its neighbours.
+- **GB10 model name.** `/proc/driver/nvidia` reports the GB10's model as "Unknown"; `nvidia-smi` shows it correctly.
+- **Metrics live in hub memory** (24 h) and reset when the hub restarts. Scrape `/metrics` with Prometheus for history.
 - **IMDS listens on `:47474` on all interfaces.** The per-instance secret in the URL protects it, but binding to the Docker bridge only would be tighter.

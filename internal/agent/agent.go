@@ -445,6 +445,28 @@ func (a *Agent) handle(env proto.Envelope) {
 				a.startInstance(*ref.Spec)
 			}
 		}
+	case proto.TypeVolumeDelete:
+		var vd proto.VolumeDelete
+		if json.Unmarshal(env.Data, &vd) == nil {
+			if vr, ok := a.rt.(VolumeRemover); ok {
+				go func() {
+					if err := vr.RemoveVolumes(a.ctx, vd.Names); err != nil {
+						a.log.Warn("volume delete failed", "names", vd.Names, "err", err)
+					} else {
+						a.log.Info("volumes deleted", "names", vd.Names)
+					}
+				}()
+			}
+		}
+	case proto.TypeVolumeSnapshot, proto.TypeVolumeRestore:
+		var vo proto.VolumeOp
+		if json.Unmarshal(env.Data, &vo) == nil {
+			op := "snapshot"
+			if env.Type == proto.TypeVolumeRestore {
+				op = "restore"
+			}
+			go a.handleVolumeOp(op, vo)
+		}
 	case proto.TypeJobAssign:
 		var ja proto.JobAssign
 		if json.Unmarshal(env.Data, &ja) == nil {

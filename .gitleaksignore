@@ -1,0 +1,4 @@
+# Test fixtures with fake credentials (not real secrets)
+internal/webhook/webhook_test.go:generic-api-key:11
+internal/s3sig/s3sig_test.go:generic-api-key:122
+f83d6fd9a57f0684edddc5daafb01bb4ca4f78d5:internal/webhook/webhook_test.go:generic-api-key:11

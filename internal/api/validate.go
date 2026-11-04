@@ -72,6 +72,17 @@ func (s *ContainerGroupSpec) Normalize() {
 			q.Concurrency = 1
 		}
 	}
+	if a := s.HTTPAutoscaler; a != nil {
+		if a.TargetConcurrency == 0 {
+			a.TargetConcurrency = 10
+		}
+		if a.StableWindowSeconds == 0 {
+			a.StableWindowSeconds = 60
+		}
+		if a.ScaleDownDelaySeconds == 0 {
+			a.ScaleDownDelaySeconds = 300
+		}
+	}
 	if a := s.QueueAutoscaler; a != nil {
 		if a.PollingPeriod == 0 {
 			a.PollingPeriod = 30
@@ -189,6 +200,76 @@ func (s *ContainerGroupSpec) Validate() map[string][]string {
 			add("queue_autoscaler.polling_period", "must be 5-1800 seconds")
 		}
 	}
+	if a := s.HTTPAutoscaler; a != nil {
+		if s.Networking == nil {
+			add("http_autoscaler", "requires networking (it scales on gateway traffic)")
+		}
+		if s.QueueAutoscaler != nil {
+			add("http_autoscaler", "can't be combined with queue_autoscaler")
+		}
+		if a.MinReplicas < 0 || a.MaxReplicas < 1 || a.MinReplicas > a.MaxReplicas || a.MaxReplicas > 1000 {
+			add("http_autoscaler", "need 0 <= min_replicas <= max_replicas <= 1000, max_replicas >= 1")
+		}
+		if a.TargetConcurrency < 1 || a.TargetConcurrency > 10000 {
+			add("http_autoscaler.target_concurrency", "must be 1-10000")
+		}
+		if a.StableWindowSeconds < 6 || a.StableWindowSeconds > 600 {
+			add("http_autoscaler.stable_window_seconds", "must be 6-600")
+		}
+		if a.ScaleDownDelaySeconds < 1 || a.ScaleDownDelaySeconds > 86400 {
+			add("http_autoscaler.scale_down_delay_seconds", "must be 1-86400")
+		}
+	}
+	if n := s.Networking; n != nil && (n.MaxConcurrency < 0 || n.MaxConcurrency > 100000) {
+		add("networking.max_concurrency", "must be 0-100000")
+	}
+	if n := s.Networking; n != nil {
+		if len(n.CustomDomains) > 20 {
+			add("networking.custom_domains", "at most 20 domains")
+		}
+		seen := map[string]bool{}
+		for i, d := range n.CustomDomains {
+			d = strings.ToLower(strings.TrimSuffix(d, "."))
+			n.CustomDomains[i] = d
+			if !ValidHostname(d) {
+				add("networking.custom_domains", "%q is not a valid hostname", d)
+			}
+			if seen[d] {
+				add("networking.custom_domains", "%q listed twice", d)
+			}
+			seen[d] = true
+		}
+	}
+	for _, p := range s.Container.Ports {
+		if p < 1 || p > 65535 {
+			add("container.ports", "%d is not a valid port", p)
+		}
+	}
+	seenVol := map[string]bool{}
+	for i, v := range s.Container.Volumes {
+		k := fmt.Sprintf("container.volumes[%d]", i)
+		if !ValidName(v.Name) || seenVol[v.Name] {
+			add(k+".name", "must be a unique lower-case name (a-z, 0-9, -)")
+		}
+		seenVol[v.Name] = true
+		if !strings.HasPrefix(v.Mount, "/") || v.Mount == "/" {
+			add(k+".mount", "must be an absolute path other than /")
+		}
+	}
+	for k, v := range s.Container.Env {
+		for _, ref := range ParseRefs(v) {
+			switch ref.Kind {
+			case "secret":
+				if !ValidSecretName(ref.Name) {
+					add("container.env."+k, "invalid secret name %q", ref.Name)
+				}
+			default:
+				if !ValidName(ref.Name) || ref.Port < 1 || ref.Port > 65535 {
+					add("container.env."+k, "link must look like {{%s:GROUP:PORT}}", ref.Kind)
+				}
+			}
+		}
+	}
 	for i, sa := range s.ScalingActions {
 		if len(strings.Fields(sa.Schedule)) != 5 {
 			add(fmt.Sprintf("scaling_actions[%d].schedule", i), "must be a 5-field cron expression")
@@ -221,4 +302,49 @@ func Slugify(name string) string {
 		}
 	}
 	return strings.Trim(b.String(), "-")
+}
+
+var (
+	refRe        = regexp.MustCompile(`\{\{\s*(secret|link|link_host|link_port):([^}\s]+)\s*\}\}`)
+	secretNameRe = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$`)
+)
+
+// ValidSecretName reports whether s is a valid secret name (letters, digits, _ . -).
+func ValidSecretName(s string) bool { return secretNameRe.MatchString(s) }
+
+// Ref is a {{secret:NAME}} or {{link:GROUP:PORT}} placeholder in an env value.
+type Ref struct {
+	Raw  string // the full placeholder text
+	Kind string // secret | link | link_host | link_port
+	Name string // secret name or target group
+	Port int    // link target port
+}
+
+// ParseRefs finds placeholders in s.
+func ParseRefs(s string) []Ref {
+	var out []Ref
+	for _, m := range refRe.FindAllStringSubmatch(s, -1) {
+		r := Ref{Raw: m[0], Kind: m[1], Name: m[2]}
+		if r.Kind != "secret" {
+			name, port, _ := strings.Cut(m[2], ":")
+			r.Name = name
+			fmt.Sscanf(port, "%d", &r.Port)
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+var hostnameRe = regexp.MustCompile(`^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,61}[a-z0-9]$`)
+
+// ValidHostname reports whether d is a fully qualified DNS hostname (no wildcard, no port).
+func ValidHostname(d string) bool { return len(d) <= 253 && hostnameRe.MatchString(d) }
+
+// DefaultReplicas applies the documented default of 1 replica to a spec whose
+// source document had no "replicas" key. Autoscaled groups keep 0: their
+// autoscaler decides.
+func (s *ContainerGroupSpec) DefaultReplicas(present bool) {
+	if !present && s.Replicas == 0 && s.QueueAutoscaler == nil && s.HTTPAutoscaler == nil {
+		s.Replicas = 1
+	}
 }

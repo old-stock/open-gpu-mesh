@@ -40,6 +40,10 @@ pre{background:#06090c;border:1px solid var(--line);border-radius:10px;padding:1
 .toast{position:fixed;right:18px;bottom:18px;background:var(--panel2);border:1px solid var(--line);padding:10px 14px;border-radius:10px;max-width:520px;white-space:pre-wrap;z-index:9}
 .gpu{display:inline-flex;gap:6px;align-items:center;margin:2px 6px 2px 0}.dot{width:8px;height:8px;border-radius:99px;display:inline-block;background:var(--mute)}.dot.ok{background:var(--acc)}.dot.warn{background:var(--warn)}.dot.bad{background:var(--bad)}
 .empty{padding:28px;text-align:center;color:var(--mute)}
+.spark{display:block;width:100%;height:42px;margin-top:6px}.spark polyline{fill:none;stroke-width:1.6;vector-effect:non-scaling-stroke}
+.form{display:grid;grid-template-columns:120px 1fr;gap:8px 12px;align-items:center}.form>label{color:var(--mute)}
+textarea.short{min-height:90px}
+footer{max-width:1320px;margin:0 auto;padding:0 20px 30px;color:var(--mute);font-size:12.5px;display:flex;gap:16px}
 </style>
 </head>
 <body>
@@ -49,6 +53,7 @@ pre{background:#06090c;border:1px solid var(--line);border-radius:10px;padding:1
   <div class="me" id="me"></div>
 </header>
 <main id="app"></main>
+<footer><span>open-gpu-mesh</span><a href="/docs" target="_blank">API docs</a><a href="/llms.txt" target="_blank">llms.txt</a><a href="/openapi.json" target="_blank">openapi.json</a></footer>
 <div id="toast" class="toast" style="display:none"></div>
 <script>
 const $ = (s, el=document) => el.querySelector(s);
@@ -57,13 +62,14 @@ let KEY = localStorage.getItem('ogm_key') || '';
 let PROJECT = localStorage.getItem('ogm_project') || 'default';
 let timer = null, abortLogs = null;
 
-async function api(method, path, body) {
-  const opt = {method, headers: {'OGM-Api-Key': KEY}};
-  if (body !== undefined) { opt.body = typeof body === 'string' ? body : JSON.stringify(body); opt.headers['Content-Type'] = 'application/json'; }
+async function api(method, path, body, opts = {}) {
+  const opt = {method, headers: {'OGM-Api-Key': KEY, ...(opts.headers || {})}};
+  if (body !== undefined) { opt.body = typeof body === 'string' ? body : JSON.stringify(body); opt.headers['Content-Type'] ??= 'application/json'; }
   const r = await fetch(path, opt);
   if (r.status === 401) { logout(); throw new Error('unauthorized'); }
   if (r.status === 204 || r.status === 202 && !r.headers.get('content-type')) return null;
   const t = await r.text();
+  if (opts.raw && r.ok) return t;
   let j = null; try { j = t ? JSON.parse(t) : null } catch { j = t }
   if (!r.ok) {
     let msg = (j && j.title) ? j.title + (j.detail ? ': ' + j.detail : '') : r.statusText;
@@ -75,21 +81,26 @@ async function api(method, path, body) {
 function toast(msg, bad) { const t = $('#toast'); t.textContent = msg; t.style.display = 'block'; t.style.borderColor = bad ? 'var(--bad)' : 'var(--line)'; clearTimeout(t._h); t._h = setTimeout(() => t.style.display = 'none', bad ? 7000 : 3000); }
 function logout() { localStorage.removeItem('ogm_key'); KEY = ''; route(); }
 const ago = t => { if (!t) return '-'; const s = (Date.now() - new Date(t)) / 1000; if (s < 60) return Math.floor(s) + 's'; if (s < 3600) return Math.floor(s/60) + 'm'; if (s < 172800) return Math.floor(s/3600) + 'h'; return Math.floor(s/86400) + 'd'; };
-const statusPill = s => { const c = {running:'ok',ready:'ok',online:'ok',succeeded:'ok',deploying:'info',allocating:'warn',downloading:'info',creating:'info',pending:'warn',stopping:'warn',stopped:'',offline:'bad',failed:'bad',cancelled:'',paused:'warn'}[s] ?? ''; return `<span class="pill ${c}">${esc(s)}</span>`; };
+const statusPill = s => { const c = {running:'ok',ready:'ok',online:'ok',succeeded:'ok',deploying:'info',allocating:'warn',downloading:'info',creating:'info',pending:'warn',stopping:'warn',stopped:'',offline:'bad',failed:'bad',cancelled:'',paused:'warn',restoring:'info',restored:'ok'}[s] ?? ''; return `<span class="pill ${c}">${esc(s)}</span>`; };
 const gb = mb => (mb/1024).toFixed(mb >= 10240 ? 0 : 1);
+const fmtBytes = n => n < 1024 ? n + ' B' : n < 1048576 ? (n/1024).toFixed(1) + ' KB' : n < 1073741824 ? (n/1048576).toFixed(1) + ' MB' : (n/1073741824).toFixed(2) + ' GB';
+const when = t => t ? new Date(t).toLocaleString() : '-';
+const until = t => { if (!t) return '-'; const s = (new Date(t) - Date.now()) / 1000; return s <= 0 ? 'now' : 'in ' + (s < 60 ? Math.ceil(s) + 's' : s < 3600 ? Math.round(s/60) + 'm' : s < 172800 ? Math.round(s/3600) + 'h' : Math.round(s/86400) + 'd'); };
+const P = () => `/v1/projects/${encodeURIComponent(PROJECT)}`;
 
-const pages = [['#/', 'Overview'], ['#/groups', 'Container groups'], ['#/queues', 'Queues'], ['#/nodes', 'Nodes'], ['#/members', 'Members'], ['#/deploy', 'Deploy'], ['#/settings', 'Settings']];
+const pages = [['#/', 'Overview'], ['#/groups', 'Container groups'], ['#/queues', 'Queues'], ['#/nodes', 'Nodes'], ['#/kv', 'KV'], ['#/schedules', 'Schedules'], ['#/storage', 'Storage'], ['#/members', 'Members'], ['#/deploy', 'Deploy'], ['#/keys', 'API keys'], ['#/settings', 'Settings']];
 
 async function route() {
   clearInterval(timer); if (abortLogs) { abortLogs.abort(); abortLogs = null; }
   const h = location.hash || '#/';
   if (!KEY) { renderLogin(); return; }
-  $('#nav').innerHTML = pages.map(([href, label]) => `<a href="${href}" class="${(h === href || (href !== '#/' && h.startsWith(href))) ? 'on' : ''}">${label}</a>`).join('');
+  $('#nav').innerHTML = pages.map(([href, label]) => `<a href="${href}" class="${(h === href || (href !== '#/' && h.startsWith(href))) ? 'on' : ''}">${label}</a>`).join('') + '<a href="/docs" target="_blank" title="API reference (also /llms.txt)">Docs ↗</a>';
   try {
-    const me = await api('GET', '/v1/me');
+    const me = window._me = await api('GET', '/v1/me');
     if (!window._cname) { window._cname = (await api('GET', '/v1/cluster')).name; document.title = window._cname + ' · ogm'; }
     $('#cname').textContent = window._cname;
-    const projects = (await api('GET', '/v1/projects')).items;
+    // Project-scoped API keys may not list projects: fall back to the stored project.
+    const projects = await api('GET', '/v1/projects').then(r => r.items, () => [{name: PROJECT}]);
     if (!projects.find(p => p.name === PROJECT) && projects.length) PROJECT = projects[0].name;
     $('#me').innerHTML = `<select id="proj" style="width:auto;padding:3px 6px">${projects.map(p => `<option ${p.name === PROJECT ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select>
       <span>${esc(me.name)} · <b class="ok">${me.credits.toFixed(2)}</b> credits</span><a href="#" onclick="logout();return false">log out</a>`;
@@ -97,7 +108,8 @@ async function route() {
   } catch (e) { return; }
   const parts = h.slice(2).split('/');
   const view = {'': viewOverview, groups: parts[1] ? () => viewGroup(decodeURIComponent(parts[1])) : viewGroups, queues: parts[1] ? () => viewQueue(decodeURIComponent(parts[1])) : viewQueues,
-    nodes: viewNodes, members: viewMembers, deploy: viewDeploy, settings: viewSettings}[parts[0]] || viewOverview;
+    nodes: viewNodes, members: viewMembers, deploy: viewDeploy, settings: viewSettings,
+    kv: parts[1] ? () => viewKVTable(decodeURIComponent(parts[1])) : viewKV, schedules: viewSchedules, storage: viewStorage, keys: viewKeys}[parts[0]] || viewOverview;
   const run = async () => { try { await view(); } catch (e) { toast(e.message, true); } };
   await run();
   if (!['deploy', 'settings'].includes(parts[0])) timer = setInterval(() => { if (!document.hidden && !document.activeElement?.matches('input,textarea,select')) run(); }, 4000);
@@ -118,7 +130,7 @@ function renderLogin() {
 }
 
 async function viewOverview() {
-  const [ci, classes, nodes, groups] = await Promise.all([api('GET', '/v1/cluster'), api('GET', '/v1/gpu-classes'), api('GET', '/v1/nodes'), api('GET', `/v1/projects/${PROJECT}/containers`)]);
+  const [ci, classes, nodes, groups] = await Promise.all([api('GET', '/v1/cluster'), api('GET', '/v1/gpu-classes'), api('GET', '/v1/nodes').catch(() => ({items: []})), api('GET', `/v1/projects/${PROJECT}/containers`)]);
   $('#cname').textContent = ci.name;
   const stat = (v, l, c='') => `<div class="card stat"><div class="v ${c}">${v}</div><div class="l">${l}</div></div>`;
   $('#app').innerHTML = `<h1>${esc(ci.name)}</h1><p class="hero">Community GPU cluster · ogm ${esc(ci.version)} · ${esc(ci.public_url)}</p>
@@ -145,7 +157,8 @@ async function viewGroups() {
 
 let groupTab = 'instances';
 async function viewGroup(name) {
-  const g = await api('GET', `/v1/projects/${PROJECT}/containers/${encodeURIComponent(name)}`);
+  const [g, m] = await Promise.all([api('GET', `/v1/projects/${PROJECT}/containers/${encodeURIComponent(name)}`),
+    api('GET', `/v1/projects/${PROJECT}/containers/${encodeURIComponent(name)}/metrics?minutes=60`).catch(() => null)]);
   const c = g.current_state.instance_status_counts, r = g.container.resources;
   const keepLogs = $('#logbox') && groupTab === 'logs' && $('#logbox').dataset.group === name;
   const head = `<div class="row"><h1>${esc(g.name)}</h1>${statusPill(g.current_state.status)}${g.pending_change ? '<span class="pill info">rolling update</span>' : ''}<span class="sp"></span>
@@ -160,10 +173,12 @@ async function viewGroup(name) {
     </div><div class="card kv">
       <div>Replicas</div><div>${c.ready_count} ready · ${c.running_count} running · ${c.creating_count + c.downloading_count} starting · ${c.allocating_count} allocating · ${c.stopping_count} stopping</div>
       <div>Gateway</div><div>${g.gateway_url ? `<a class="mono" target="_blank" href="${esc(g.gateway_url)}">${esc(g.gateway_url)}</a><br><span class="mute">${esc(g.networking.load_balancer)} · ${g.networking.auth ? 'auth required (OGM-Api-Key, Bearer, or ?ogm_token=)' : 'public'}${g.networking.single_connection_limit ? ' · single connection' : ''}</span>` : '<span class="mute">disabled</span>'}</div>
+      ${(g.networking?.custom_domains || []).length ? `<div>Custom domains</div><div>${g.networking.custom_domains.map(d => `<a class="mono" target="_blank" href="https://${esc(d)}/">${esc(d)}</a>`).join('<br>')}</div>` : ''}
       ${g.gateway_token ? `<div>Share token</div><div><span class="mono" style="user-select:all">${esc(g.gateway_token)}</span> <a href="#" id="rotgw">rotate</a><br><span class="mute">works only for this endpoint</span></div>` : ''}
       <div>Queue</div><div>${g.queue_connection ? `<a href="#/queues/${encodeURIComponent(g.queue_connection.queue_name)}">${esc(g.queue_connection.queue_name)}</a> → :${g.queue_connection.port}${esc(g.queue_connection.path)} ${g.queue_stats ? `<span class="mute">(${g.queue_stats.pending} pending, ${g.queue_stats.running} running)</span>` : ''}` : '<span class="mute">none</span>'}</div>
       <div>Autoscaler</div><div>${g.queue_autoscaler ? `${g.queue_autoscaler.min_replicas}–${g.queue_autoscaler.max_replicas} replicas, ${g.queue_autoscaler.desired_queue_length} jobs/replica` : (g.scheduled_scaling_enabled ? 'scheduled' : '<span class="mute">manual</span>')}</div>
     </div></div>
+    ${metricsPanel(m)}
     <div class="tabs">${['instances', 'events', 'logs', 'spec'].map(t => `<a href="#" data-tab="${t}" class="${groupTab === t ? 'on' : ''}">${t}</a>`).join('')}</div><div id="tab"></div>`;
   const base = `/v1/projects/${PROJECT}/containers/${encodeURIComponent(name)}`;
   const bind = () => {
@@ -212,6 +227,34 @@ async function viewGroup(name) {
   }
 }
 
+// Inline SVG sparkline; null values leave gaps.
+function spark(vals, color, fmt = v => v) {
+  const nn = vals.filter(v => v != null), max = Math.max(1e-9, ...nn), W = 200, H = 40, n = Math.max(1, vals.length - 1);
+  const segs = []; let cur = [];
+  vals.forEach((v, i) => { if (v == null) { if (cur.length) segs.push(cur); cur = []; } else cur.push(`${(i * W / n).toFixed(1)},${(H - 2 - (v / max) * (H - 4)).toFixed(1)}`); });
+  if (cur.length) segs.push(cur);
+  const body = segs.map(sg => (sg.length === 1 ? [sg[0], sg[0].replace(/^[\d.]+/, x => (+x + 2).toFixed(1))] : sg)).map(sg =>
+    `<polygon points="${sg[0].split(',')[0]},${H} ${sg.join(' ')} ${sg[sg.length-1].split(',')[0]},${H}" fill="${color}" fill-opacity=".12"/><polyline points="${sg.join(' ')}" stroke="${color}"/>`).join('');
+  return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"><title>max ${esc(fmt(nn.length ? max : 0))}</title><line x1="0" y1="${H - .5}" x2="${W}" y2="${H - .5}" stroke="#223041"/>${body}</svg>`;
+}
+
+function metricsPanel(m) {
+  if (!m) return '';
+  const N = m.minutes || 60, end = Math.floor(Date.now() / 60000), byMin = {};
+  (m.points || []).forEach(p => byMin[Math.floor(Date.parse(p.time) / 60000)] = p);
+  const pts = Array.from({length: N}, (_, i) => byMin[end - N + 1 + i] || null);
+  const ser = f => pts.map(p => p ? f(p) : null), last = a => { for (let i = a.length - 1; i >= 0; i--) if (a[i] != null) return a[i]; return null; };
+  const req = ser(p => p.requests), err = ser(p => p.errors_4xx + p.errors_5xx), p95 = ser(p => p.requests ? p.p95_ms : null), ready = ser(p => p.ready_replicas);
+  const sm = m.summary || {}, ms = v => v == null ? '-' : v >= 1000 ? (v / 1000).toFixed(2) + ' s' : v.toFixed(v < 10 ? 1 : 0) + ' ms';
+  const card = (label, val, sub, vals, color, fmt) => `<div class="card stat"><div class="l">${label}</div><div class="v" style="font-size:20px">${val}</div><div class="mute" style="font-size:12px">${sub}</div>${spark(vals, color, fmt)}</div>`;
+  if (!(m.points || []).length) return `<h2>Metrics · last ${N} min</h2><div class="card empty">No data yet. Metrics come from gateway traffic and replica counts, kept in hub memory.</div>`;
+  return `<h2>Metrics · last ${N} min</h2><div class="grid g4">
+    ${card('Requests / min', last(req) ?? 0, `${sm.requests ?? 0} total`, req, 'var(--info)', v => v)}
+    ${card('Errors / min', last(err) ?? 0, `<span class="${sm.errors_4xx ? 'warn' : ''}">${sm.errors_4xx ?? 0} 4xx</span> · <span class="${sm.errors_5xx ? 'bad' : ''}">${sm.errors_5xx ?? 0} 5xx</span>`, err, 'var(--bad)', v => v)}
+    ${card('p95 latency', ms(last(p95)), `p50 ${ms(sm.p50_ms)} · p95 ${ms(sm.p95_ms)} · p99 ${ms(sm.p99_ms)}`, p95, 'var(--warn)', ms)}
+    ${card('Ready replicas', last(ready) ?? '-', `desired ${last(ser(p => p.desired_replicas)) ?? '-'}`, ready, 'var(--acc)', v => v)}</div>`;
+}
+
 async function viewQueues() {
   const qs = await api('GET', `/v1/projects/${PROJECT}/queues`);
   $('#app').innerHTML = `<div class="row"><h1>Queues</h1><span class="sp"></span><input id="qn" placeholder="new-queue-name" style="width:220px"><button id="qc">Create queue</button></div>
@@ -230,11 +273,19 @@ async function viewQueue(name) {
   document.querySelectorAll('[data-cancel]').forEach(b => b.onclick = async () => { try { await api('DELETE', base + '/jobs/' + b.dataset.cancel); viewQueue(name); } catch (e) { toast(e.message, true); } });
 }
 
+function auditCell(a) {
+  if (!a) return '<span class="mute">not audited</span>';
+  const n = a.network || {}, lo = (x, y) => (x && y) ? Math.min(x, y) : (x || y), down = lo(n.hub_down_mbps, n.internet_down_mbps), up = lo(n.hub_up_mbps, n.internet_up_mbps);
+  const tip = (a.recommendations || []).map(r => (r.level === 'info' ? '- ' : '! ') + r.text).join('\n') + '\n\nSuggested: ' + ((a.suggested || {}).agent_flags || '');
+  const cls = {anchor: 'ok', compute: '', burst: 'warn', unsuitable: 'bad'}[a.tier] || '';
+  return `<span class="${cls}" title="${esc(tip)}"><b>${esc(a.tier)}</b></span><br><span class="mute">${down ? `↓${down.toFixed(0)} ↑${up.toFixed(0)} Mbps` : 'no speed test'}${n.nat ? ' · ' + esc(n.nat) : ''}</span>`;
+}
+
 function nodesTable(items) {
   if (!items.length) return `<div class="card empty">No nodes yet. Create a join token in <a href="#/settings">Settings</a> and run the agent on a GPU machine.</div>`;
-  return `<table><thead><tr><th>Node</th><th>Owner</th><th>Status</th><th>GPUs</th><th>CPU / RAM</th><th>Country</th><th>Instances</th><th>Uptime</th><th>Agent</th><th>Seen</th></tr></thead><tbody>${items.map(n => `<tr><td><b>${esc(n.name)}</b><br><span class="mono mute">${esc(n.id)}</span></td><td>${esc(n.owner)}</td><td>${statusPill(n.paused && n.status === 'online' ? 'paused' : n.status)}${n.pause_reason ? `<br><span class="mute">${esc(n.pause_reason)}</span>` : ''}</td>
+  return `<table><thead><tr><th>Node</th><th>Owner</th><th>Status</th><th>GPUs</th><th>CPU / RAM</th><th>Country</th><th>Instances</th><th>Uptime</th><th>Audit</th><th>Agent</th><th>Seen</th></tr></thead><tbody>${items.map(n => `<tr><td><b>${esc(n.name)}</b><br><span class="mono mute">${esc(n.id)}</span></td><td>${esc(n.owner)}</td><td>${statusPill(n.paused && n.status === 'online' ? 'paused' : n.status)}${n.pause_reason ? `<br><span class="mute">${esc(n.pause_reason)}</span>` : ''}</td>
     <td class="wrap">${n.gpus.map(g => `<span class="gpu"><span class="dot ${g.util_percent > 80 ? 'warn' : 'ok'}"></span>${esc(g.name)} <span class="mute">${g.unified_memory ? 'unified ' : ''}${gb(g.mem_used_mb || 0)}/${gb(g.vram_mb)}G used · ${g.util_percent.toFixed(0)}% · ${g.temp_c.toFixed(0)}°C</span></span>`).join('<br>') || '<span class="mute">cpu only</span>'}</td>
-    <td>${n.cpu} · ${gb(n.memory_mb)}G</td><td>${esc(n.country || '-')}</td><td>${n.instances}</td><td>${(n.uptime_ratio*100).toFixed(0)}%</td><td class="mute">${esc(n.runtime || '')} ${esc(n.version || '')}</td><td>${ago(n.last_seen)}</td></tr>`).join('')}</tbody></table>`;
+    <td>${n.cpu} · ${gb(n.memory_mb)}G</td><td>${esc(n.country || '-')}</td><td>${n.instances}</td><td>${(n.uptime_ratio*100).toFixed(0)}%</td><td>${auditCell(n.assessment)}</td><td class="mute">${esc(n.runtime || '')} ${esc(n.version || '')}</td><td>${ago(n.last_seen)}</td></tr>`).join('')}</tbody></table>`;
 }
 
 async function viewNodes() {
@@ -300,6 +351,213 @@ async function viewSettings() {
   $('#inv') && ($('#inv').onclick = async () => { try { const i = await api('POST', '/v1/invites', {uses: +$('#iu').value}); const o = $('#iout'); o.style.display = 'block'; o.textContent = `code: ${i.code}\n\n${i.join_command}\n\n(or paste the code on the sign-in page)`; } catch (e) { toast(e.message, true); } });
   $('#rot').onclick = async () => { if (!confirm('Rotate your API key? The old key stops working.')) return; const u = await api('POST', '/v1/me/rotate-key'); KEY = u.api_key; localStorage.setItem('ogm_key', KEY); alert('New API key:\n\n' + KEY); };
   $('#padd').onclick = async () => { try { await api('POST', '/v1/projects', {name: $('#pn').value.trim()}); PROJECT = $('#pn').value.trim(); localStorage.setItem('ogm_project', PROJECT); route(); } catch (e) { toast(e.message, true); } };
+}
+
+// ---------- services: shared helpers ----------
+// Renders a view's static part (forms) once per route+project, so the 4s refresh only redraws lists
+// and never wipes what the user is typing. Returns [root, fresh].
+function shell(key, html) {
+  let root = $('#svc');
+  if (root && root.dataset.key === key) return [root, false];
+  $('#app').innerHTML = `<div id="svc" data-key="${esc(key)}">${html}</div>`;
+  return [$('#svc'), true];
+}
+// One delegated click handler per shell: elements with data-a="action" call handlers[action](el).
+function delegate(root, handlers) {
+  root.onclick = async e => {
+    const el = e.target.closest('[data-a]'); if (!el || !root.contains(el) || !handlers[el.dataset.a]) return;
+    e.preventDefault();
+    try { await handlers[el.dataset.a](el); } catch (err) { toast(err.message, true); }
+  };
+}
+const kpath = k => k.split('/').map(encodeURIComponent).join('/');
+const val = id => $('#' + id).value.trim();
+async function copyText(t) {
+  try { await navigator.clipboard.writeText(t); }
+  catch { const ta = document.createElement('textarea'); ta.value = t; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove(); }
+  toast('copied');
+}
+
+// ---------- KV ----------
+async function viewKV() {
+  const [root, fresh] = shell('kv:' + PROJECT, `<h1>Key-value store</h1><p class="hero">Per-project tables of keys: values up to 1 MiB, optional TTL, versions for compare-and-set. API: <span class="mono">${esc(P())}/kv/{table}/{key}</span></p>
+    <div class="card" style="margin-bottom:14px"><b>Put a key</b><div class="form" style="margin-top:10px">
+      <label>Table</label><input id="kvt" placeholder="e.g. sessions">
+      <label>Key</label><input id="kvk" placeholder="user/42/profile (slashes allowed)">
+      <label>TTL (seconds)</label><input id="kvttl" type="number" min="0" placeholder="0 = never expires" style="width:200px">
+      <label>Value</label><textarea id="kvv" class="short" placeholder='{"hello": "world"}'></textarea>
+      <span></span><div class="row"><button class="primary" data-a="put">Put</button></div></div></div>
+    <h2>Tables</h2><div id="list"></div>`);
+  if (fresh) delegate(root, {
+    put: async () => { const t = val('kvt'), k = $('#kvk').value; if (!t || !k) throw new Error('table and key are required');
+      await kvPut(t, k, $('#kvv').value, +$('#kvttl').value); toast(`put ${t}/${k}`); viewKV(); },
+    drop: async el => { const t = el.dataset.t; if (!confirm(`Drop table ${t} and all its keys?`)) return;
+      const r = await api('DELETE', `${P()}/kv/${encodeURIComponent(t)}`); toast(`dropped ${t} (${r?.deleted ?? 0} keys)`); viewKV(); },
+  });
+  const ts = await api('GET', `${P()}/kv`);
+  $('#list', root).innerHTML = ts.items.length ? `<table><thead><tr><th>Table</th><th>Keys</th><th>Size</th><th></th></tr></thead><tbody>${ts.items.map(t => `<tr><td><a href="#/kv/${encodeURIComponent(t.name)}"><b>${esc(t.name)}</b></a></td><td>${t.keys}</td><td>${fmtBytes(t.bytes)}</td><td><button class="danger" data-a="drop" data-t="${esc(t.name)}">drop</button></td></tr>`).join('')}</tbody></table>`
+    : `<div class="card empty">No tables yet. Put a key above (tables are created on first write).</div>`;
+}
+
+async function kvPut(table, key, value, ttl) {
+  let ct = 'text/plain; charset=utf-8'; try { JSON.parse(value); ct = 'application/json'; } catch {}
+  return api('PUT', `${P()}/kv/${encodeURIComponent(table)}/${kpath(key)}${ttl > 0 ? '?ttl=' + ttl : ''}`, value, {headers: {'Content-Type': ct}});
+}
+
+const kvState = {table: '', prefix: '', after: '', pages: []};
+async function viewKVTable(table) {
+  if (kvState.table !== table) Object.assign(kvState, {table, prefix: '', after: '', pages: []});
+  const base = `${P()}/kv/${encodeURIComponent(table)}`;
+  const [root, fresh] = shell(`kvt:${PROJECT}:${table}`, `<div class="row"><a href="#/kv">← tables</a></div>
+    <div class="row"><h1>${esc(table)}</h1><span class="sp"></span><button class="danger" data-a="drop">Drop table</button></div>
+    <div class="grid g2"><div class="card"><b>Put a key</b><div class="form" style="margin-top:10px">
+      <label>Key</label><input id="kvk" placeholder="user/42/profile">
+      <label>TTL (seconds)</label><input id="kvttl" type="number" min="0" placeholder="0 = never" style="width:200px">
+      <label>Value</label><textarea id="kvv" class="short"></textarea>
+      <span></span><div class="row"><button class="primary" data-a="put">Put</button></div></div></div>
+    <div class="card"><div class="row"><b>Value</b><span class="sp"></span><span id="kvmeta" class="mute mono"></span></div><pre id="kvview" class="mono" style="max-height:260px;margin:10px 0 0;white-space:pre-wrap;word-break:break-all"><span class="mute">Click "view" on a key.</span></pre></div></div>
+    <div class="row" style="margin:16px 0 10px"><input id="kvp" placeholder="filter by key prefix…" style="width:320px" value="${esc(kvState.prefix)}"><span class="sp"></span><span id="kvpg" class="mute"></span></div>
+    <div id="list"></div>`);
+  if (fresh) {
+    let deb; $('#kvp').oninput = () => { clearTimeout(deb); deb = setTimeout(() => { Object.assign(kvState, {prefix: $('#kvp').value, after: '', pages: []}); viewKVTable(table); }, 300); };
+    delegate(root, {
+      put: async () => { const k = $('#kvk').value; if (!k) throw new Error('key is required');
+        const r = await kvPut(table, k, $('#kvv').value, +$('#kvttl').value); toast(`put ${k} (v${r.version})`); viewKVTable(table); },
+      view: async el => { const k = el.dataset.k, v = await api('GET', `${base}/${kpath(k)}`, undefined, {raw: true});
+        let pretty = v; try { pretty = JSON.stringify(JSON.parse(v), null, 2); } catch {}
+        $('#kvmeta').textContent = `${k} · ${fmtBytes(new Blob([v]).size)}`; $('#kvview').textContent = pretty; },
+      edit: async el => { const k = el.dataset.k; $('#kvk').value = k; $('#kvv').value = await api('GET', `${base}/${kpath(k)}`, undefined, {raw: true}); $('#kvv').focus(); },
+      del: async el => { const k = el.dataset.k; if (!confirm(`Delete key ${k}?`)) return; await api('DELETE', `${base}/${kpath(k)}`); toast('deleted ' + k); viewKVTable(table); },
+      drop: async () => { if (!confirm(`Drop table ${table} and all its keys?`)) return; await api('DELETE', base); toast('dropped ' + table); location.hash = '#/kv'; },
+      next: async el => { kvState.pages.push(kvState.after); kvState.after = el.dataset.after; viewKVTable(table); },
+      prev: async () => { kvState.after = kvState.pages.pop() || ''; viewKVTable(table); },
+    });
+  }
+  const r = await api('GET', `${base}?values=1&limit=100&prefix=${encodeURIComponent(kvState.prefix)}&after=${encodeURIComponent(kvState.after)}`);
+  $('#kvpg').innerHTML = `${kvState.pages.length ? '<a href="#" data-a="prev">← prev</a> ' : ''}${r.next_after ? `<a href="#" data-a="next" data-after="${esc(r.next_after)}">next →</a>` : ''}`;
+  $('#list', root).innerHTML = r.items.length ? `<table><thead><tr><th>Key</th><th>Version</th><th>Size</th><th>Value</th><th>Expires</th><th>Updated</th><th></th></tr></thead><tbody>${r.items.map(i => `<tr><td class="mono"><a href="#" data-a="view" data-k="${esc(i.key)}">${esc(i.key)}</a></td><td>${i.version}</td><td>${fmtBytes(i.size)}</td><td class="mono mute" style="max-width:380px;overflow:hidden;text-overflow:ellipsis">${esc((i.value ?? '').slice(0, 120))}</td><td>${i.expire_time ? `<span title="${esc(when(i.expire_time))}">${until(i.expire_time)}</span>` : '<span class="mute">never</span>'}</td><td>${ago(i.update_time)} ago</td><td><button data-a="view" data-k="${esc(i.key)}">view</button> <button data-a="edit" data-k="${esc(i.key)}">edit</button> <button class="danger" data-a="del" data-k="${esc(i.key)}">delete</button></td></tr>`).join('')}</tbody></table>`
+    : `<div class="card empty">${kvState.prefix ? 'No keys match that prefix.' : 'This table is empty.'}</div>`;
+}
+
+// ---------- schedules ----------
+function schedAction(s) {
+  if (s.job) return `job → <a href="#/queues/${encodeURIComponent(s.job.queue)}">${esc(s.job.queue)}</a>${s.job.input ? ` <span class="mono mute">${esc(JSON.stringify(s.job.input).slice(0, 60))}</span>` : ''}`;
+  if (s.http) return `http ${esc(s.http.method || 'POST')} <a href="#/groups/${encodeURIComponent(s.http.group)}">${esc(s.http.group)}</a><span class="mono">${esc(s.http.path || '/')}</span>`;
+  if (s.scale) return `scale <a href="#/groups/${encodeURIComponent(s.scale.group)}">${esc(s.scale.group)}</a> → ${s.scale.replicas}`;
+  return '<span class="mute">-</span>';
+}
+const statusText = st => !st ? '<span class="mute">-</span>' : `<span class="${st.startsWith('ok') ? 'ok' : st.startsWith('error') ? 'bad' : ''}">${esc(st)}</span>`;
+let schedCache = [];
+async function viewSchedules() {
+  const [root, fresh] = shell('sched:' + PROJECT, `<h1>Schedules</h1><p class="hero">Run an action on a cron schedule (5 fields, hub time zone): submit a queue job, call a container group over HTTP, or set its replicas.</p>
+    <div class="card" style="margin-bottom:14px"><b>New schedule</b><div class="form" style="margin-top:10px">
+      <label>Name</label><input id="sn" placeholder="nightly-report">
+      <label>Cron</label><div class="row"><input id="sc" placeholder="0 3 * * *" style="width:200px" class="mono"><span class="mute">min hour day month weekday · e.g. <span class="mono">*/15 * * * *</span>, <span class="mono">0 9 * * 1-5</span></span></div>
+      <label>Action</label><select id="st" style="width:200px"><option value="job">submit job</option><option value="http">HTTP call</option><option value="scale">scale group</option></select>
+      <label data-for="job">Queue</label><input data-for="job" id="sjq" list="dl-queues" placeholder="queue name">
+      <label data-for="job">Input JSON</label><textarea data-for="job" id="sji" class="short">{}</textarea>
+      <label data-for="http">Group</label><input data-for="http" id="shg" list="dl-groups" placeholder="container group">
+      <label data-for="http">Request</label><div data-for="http" class="row"><select id="shm" style="width:110px">${['POST','GET','PUT','PATCH','DELETE'].map(m => `<option>${m}</option>`).join('')}</select><input id="shp" placeholder="/path" value="/" style="width:320px" class="mono"></div>
+      <label data-for="http">Body</label><textarea data-for="http" id="shb" class="short" placeholder="optional request body"></textarea>
+      <label data-for="scale">Group</label><input data-for="scale" id="ssg" list="dl-groups" placeholder="container group">
+      <label data-for="scale">Replicas</label><input data-for="scale" id="ssr" type="number" min="0" value="0" style="width:120px">
+      <label>Comment</label><input id="scm" placeholder="optional">
+      <span></span><div class="row"><button class="primary" data-a="create">Create schedule</button></div></div>
+      <datalist id="dl-queues"></datalist><datalist id="dl-groups"></datalist></div>
+    <div id="list"></div>`);
+  if (fresh) {
+    const sync = () => root.querySelectorAll('[data-for]').forEach(el => el.style.display = el.dataset.for === $('#st').value ? '' : 'none');
+    $('#st').onchange = sync; sync();
+    Promise.all([api('GET', `${P()}/queues`), api('GET', `${P()}/containers`)]).then(([q, g]) => {
+      $('#dl-queues').innerHTML = q.items.map(x => `<option value="${esc(x.name)}">`).join('');
+      $('#dl-groups').innerHTML = g.items.map(x => `<option value="${esc(x.name)}">`).join('');
+    }).catch(() => {});
+    const find = n => schedCache.find(s => s.name === n);
+    const spec = s => ({name: s.name, schedule: s.schedule, enabled: s.enabled, job: s.job, http: s.http, scale: s.scale, comment: s.comment});
+    delegate(root, {
+      create: async () => {
+        const sp = {name: val('sn'), schedule: val('sc'), comment: val('scm') || undefined}, t = $('#st').value;
+        if (t === 'job') { let input; try { input = $('#sji').value.trim() ? JSON.parse($('#sji').value) : undefined; } catch (e) { throw new Error('input is not valid JSON: ' + e.message); } sp.job = {queue: val('sjq'), input}; }
+        if (t === 'http') sp.http = {group: val('shg'), method: $('#shm').value, path: val('shp') || '/', body: $('#shb').value || undefined};
+        if (t === 'scale') sp.scale = {group: val('ssg'), replicas: +$('#ssr').value};
+        await api('POST', `${P()}/schedules`, sp); toast('created ' + sp.name); $('#sn').value = $('#scm').value = ''; viewSchedules();
+      },
+      run: async el => { const r = await api('POST', `${P()}/schedules/${encodeURIComponent(el.dataset.n)}/run`); toast(`${el.dataset.n}: ${r.status}`, (r.status || '').startsWith('error')); viewSchedules(); },
+      toggle: async el => { const s = find(el.dataset.n); await api('PUT', `${P()}/schedules/${encodeURIComponent(s.name)}`, {...spec(s), enabled: !s.enabled}); toast(`${s.name} ${s.enabled ? 'disabled' : 'enabled'}`); viewSchedules(); },
+      del: async el => { if (!confirm(`Delete schedule ${el.dataset.n}?`)) return; await api('DELETE', `${P()}/schedules/${encodeURIComponent(el.dataset.n)}`); toast('deleted ' + el.dataset.n); viewSchedules(); },
+    });
+  }
+  const r = await api('GET', `${P()}/schedules`); schedCache = r.items;
+  $('#list', root).innerHTML = r.items.length ? `<table><thead><tr><th>Name</th><th>Cron</th><th>Action</th><th>State</th><th>Next run</th><th>Last run</th><th>Runs</th><th></th></tr></thead><tbody>${r.items.map(s => `<tr><td><b>${esc(s.name)}</b>${s.comment ? `<br><span class="mute">${esc(s.comment)}</span>` : ''}</td><td class="mono">${esc(s.schedule)}</td><td class="wrap">${schedAction(s)}</td><td>${s.enabled ? '<span class="pill ok">enabled</span>' : '<span class="pill">disabled</span>'}</td><td>${s.next_run_time ? `<span title="${esc(when(s.next_run_time))}">${until(s.next_run_time)}</span>` : '<span class="mute">-</span>'}</td><td>${s.last_run_time ? `<span title="${esc(when(s.last_run_time))}">${ago(s.last_run_time)} ago</span><br>` : ''}${statusText(s.last_status)}</td><td>${s.runs}</td>
+    <td><button data-a="run" data-n="${esc(s.name)}">run now</button> <button data-a="toggle" data-n="${esc(s.name)}">${s.enabled ? 'disable' : 'enable'}</button> <button class="danger" data-a="del" data-n="${esc(s.name)}">delete</button></td></tr>`).join('')}</tbody></table>`
+    : `<div class="card empty">No schedules yet.</div>`;
+}
+
+// ---------- storage: volumes, snapshots, secrets, files ----------
+async function viewStorage() {
+  const [root, fresh] = shell('storage:' + PROJECT, `<h1>Storage</h1><p class="hero">Persistent volumes live on the node that first ran a replica (the replica is pinned there). Snapshots are stored in the project file store and can be restored to any node.</p>
+    <h2>Volumes</h2><div id="vols"></div>
+    <h2>Snapshots</h2><div id="snaps"></div>
+    <h2>Secrets</h2><div class="card" style="margin-bottom:10px"><div class="row"><input id="secn" placeholder="NAME" style="width:240px" class="mono"><input id="secv" type="password" placeholder="value (write-only)" style="width:360px" autocomplete="new-password"><button class="primary" data-a="secset">Set secret</button><span class="mute">reference as <span class="mono">{{secret:NAME}}</span> in env or registry auth</span></div></div><div id="secs"></div>
+    <h2>Files</h2><div id="files"></div>`);
+  const base = P();
+  if (fresh) delegate(root, {
+    snap: async el => { const name = prompt(`Snapshot name for ${el.dataset.g} replica ${el.dataset.r} (optional):`, ''); if (name === null) return;
+      const s = await api('POST', `${base}/volumes/${encodeURIComponent(el.dataset.g)}/snapshots`, {name, replica: +el.dataset.r}); toast('snapshot ' + s.id + ' started'); viewStorage(); },
+    voldel: async el => { if (!confirm(`Delete the volumes of ${el.dataset.g} replica ${el.dataset.r}? The data is removed from the node.`)) return;
+      await api('DELETE', `${base}/volumes/${encodeURIComponent(el.dataset.g)}?replica=${el.dataset.r}`); toast('volumes deleted'); viewStorage(); },
+    restore: async el => { const node = prompt(`Restore snapshot ${el.dataset.id} onto which node? (id or name; blank = the replica's pinned node, else the snapshot's node)`, ''); if (node === null) return;
+      await api('POST', `${base}/snapshots/${encodeURIComponent(el.dataset.id)}/restore`, node.trim() ? {node: node.trim()} : {}); toast('restore started'); viewStorage(); },
+    snapdel: async el => { if (!confirm(`Delete snapshot ${el.dataset.id}?`)) return; await api('DELETE', `${base}/snapshots/${encodeURIComponent(el.dataset.id)}`); toast('snapshot deleted'); viewStorage(); },
+    secset: async () => { const n = val('secn'); if (!n) throw new Error('name is required'); await api('PUT', `${base}/secrets/${encodeURIComponent(n)}`, {value: $('#secv').value}); $('#secv').value = ''; toast('secret ' + n + ' set'); viewStorage(); },
+    secdel: async el => { if (!confirm(`Delete secret ${el.dataset.n}? Groups referencing it will fail to start.`)) return; await api('DELETE', `${base}/secrets/${encodeURIComponent(el.dataset.n)}`); toast('secret deleted'); viewStorage(); },
+  });
+  const [vols, snaps, secs, files] = await Promise.all(['volumes', 'snapshots', 'secrets', 'files'].map(x => api('GET', `${base}/${x}`)));
+  $('#vols', root).innerHTML = vols.items.length ? `<table><thead><tr><th>Group</th><th>Replica</th><th>Node</th><th>Volumes</th><th>In use</th><th></th></tr></thead><tbody>${vols.items.map(v => `<tr><td><a href="#/groups/${encodeURIComponent(v.group)}"><b>${esc(v.group)}</b></a></td><td>${v.replica}</td><td>${esc(v.node_name || v.node_id)}</td><td class="mono wrap">${(v.volumes || []).map(esc).join('<br>')}</td><td>${v.in_use ? '<span class="pill ok">in use</span>' : '<span class="pill">idle</span>'}</td>
+    <td><button data-a="snap" data-g="${esc(v.group)}" data-r="${v.replica}">snapshot</button> <button class="danger" data-a="voldel" data-g="${esc(v.group)}" data-r="${v.replica}" ${v.in_use ? 'disabled title="stop or scale down the group first"' : ''}>delete</button></td></tr>`).join('')}</tbody></table>`
+    : `<div class="card empty">No volumes. Add <span class="mono">container.volumes</span> to a group spec to get persistent storage.</div>`;
+  $('#snaps', root).innerHTML = snaps.items.length ? `<table><thead><tr><th>Snapshot</th><th>Group / replica</th><th>Status</th><th>Size</th><th>Restore</th><th>Created</th><th></th></tr></thead><tbody>${snaps.items.map(s => `<tr><td><b>${esc(s.name || '-')}</b><br><span class="mono mute">${esc(s.id)}</span></td><td>${esc(s.group)} / ${s.replica}</td><td>${statusPill(s.status)}${s.error ? `<br><span class="bad wrap">${esc(s.error)}</span>` : ''}</td><td>${s.bytes ? fmtBytes(s.bytes) : '-'}</td><td>${s.restore_status ? (s.restore_status.startsWith('failed') ? `<span class="bad">${esc(s.restore_status)}</span>` : statusPill(s.restore_status)) : '<span class="mute">-</span>'}</td><td>${ago(s.create_time)} ago</td>
+    <td><button data-a="restore" data-id="${esc(s.id)}" ${s.status !== 'ready' ? 'disabled' : ''}>restore</button> <button class="danger" data-a="snapdel" data-id="${esc(s.id)}">delete</button></td></tr>`).join('')}</tbody></table>`
+    : `<div class="card empty">No snapshots. Use "snapshot" on a volume above.</div>`;
+  $('#secs', root).innerHTML = secs.items.length ? `<table><thead><tr><th>Name</th><th>Created</th><th>Updated</th><th></th></tr></thead><tbody>${secs.items.map(s => `<tr><td class="mono"><b>${esc(s.name)}</b></td><td>${ago(s.create_time)} ago</td><td>${ago(s.update_time)} ago</td><td><button class="danger" data-a="secdel" data-n="${esc(s.name)}">delete</button></td></tr>`).join('')}</tbody></table>`
+    : `<div class="card empty">No secrets.</div>`;
+  const fl = files.items;
+  $('#files', root).innerHTML = fl.length ? `<table><thead><tr><th>Path</th><th>Size</th><th>Type</th><th>Created</th></tr></thead><tbody>${fl.slice(0, 300).map(f => `<tr><td class="mono">${esc(f.path)}</td><td>${fmtBytes(f.size)}</td><td class="mute">${esc(f.content_type || '')}</td><td>${ago(f.create_time)} ago</td></tr>`).join('')}${fl.length > 300 ? `<tr><td colspan="4" class="mute">… ${fl.length - 300} more (use <span class="mono">ogm files ls</span>)</td></tr>` : ''}</tbody></table>`
+    : `<div class="card empty">No files. Upload with <span class="mono">PUT ${esc(base)}/files/{path}</span>.</div>`;
+}
+
+// ---------- API keys ----------
+async function viewKeys() {
+  const admin = window._me?.role === 'admin';
+  const [root, fresh] = shell('keys:' + PROJECT, `<h1>API keys</h1><p class="hero">Scoped keys for CI, scripts and agents. A key can be limited to one project and a role; the secret is shown once.</p>
+    <div class="card" style="margin-bottom:14px"><b>Create a key</b><div class="form" style="margin-top:10px">
+      <label>Name</label><input id="kn" placeholder="ci-deploy">
+      <label>Project</label><select id="kp" style="width:260px"><option value="">all my projects</option></select>
+      <label>Role</label><select id="kr" style="width:260px"><option value="developer">developer — deploy, jobs, kv, files</option><option value="viewer">viewer — read only</option>${admin ? '<option value="admin">admin — everything</option>' : ''}</select>
+      <label>Expires</label><select id="ke" style="width:260px"><option value="24">in 1 day</option><option value="168">in 7 days</option><option value="720" selected>in 30 days</option><option value="2160">in 90 days</option><option value="8760">in 1 year</option><option value="0">never</option></select>
+      <span></span><div class="row"><button class="primary" data-a="create">Create key</button></div></div>
+      <div id="knew" style="display:none;margin-top:12px"></div></div>
+    <div class="row"><h2 style="margin:10px 0">Keys</h2><span class="sp"></span>${admin ? '<label class="mute"><input type="checkbox" id="kall" style="width:auto"> all users</label>' : ''}</div><div id="list"></div>`);
+  if (fresh) {
+    api('GET', '/v1/projects').then(ps => { $('#kp').insertAdjacentHTML('beforeend', ps.items.map(p => `<option ${p.name === PROJECT ? 'selected' : ''}>${esc(p.name)}</option>`).join('')); }).catch(() => {});
+    $('#kall') && ($('#kall').onchange = () => viewKeys());
+    delegate(root, {
+      create: async () => {
+        const k = await api('POST', '/v1/keys', {name: val('kn'), project: $('#kp').value, role: $('#kr').value, expires_in_hours: +$('#ke').value});
+        const box = $('#knew'); box.style.display = 'block';
+        box.innerHTML = `<p class="warn">Copy this key now: it will not be shown again.</p><div class="row"><input readonly class="mono" id="knk" value="${esc(k.key)}" style="flex:1"><button data-a="copy">Copy</button><button data-a="hide">Done</button></div>`;
+        $('#knk').select(); $('#kn').value = ''; viewKeys();
+      },
+      copy: async () => copyText($('#knk').value),
+      hide: async () => { $('#knew').style.display = 'none'; $('#knew').innerHTML = ''; },
+      revoke: async el => { if (!confirm(`Revoke key ${el.dataset.n}? Anything using it stops working immediately.`)) return; await api('DELETE', '/v1/keys/' + encodeURIComponent(el.dataset.id)); toast('revoked ' + el.dataset.n); viewKeys(); },
+    });
+  }
+  const r = await api('GET', '/v1/keys' + ($('#kall')?.checked ? '?all=1' : ''));
+  const expired = k => k.expire_time && new Date(k.expire_time) < Date.now();
+  $('#list', root).innerHTML = r.items.length ? `<table><thead><tr><th>Name</th><th>Project</th><th>Role</th><th>User</th><th>Created</th><th>Last used</th><th>Expires</th><th></th></tr></thead><tbody>${r.items.map(k => `<tr><td><b>${esc(k.name)}</b><br><span class="mono mute">${esc(k.id)}</span></td><td>${k.project ? esc(k.project) : '<span class="mute">all</span>'}</td><td><span class="pill ${k.role === 'admin' ? 'warn' : k.role === 'viewer' ? '' : 'info'}">${esc(k.role)}</span></td><td>${esc(k.user)}</td><td>${ago(k.create_time)} ago</td><td>${k.last_used_time ? ago(k.last_used_time) + ' ago' : '<span class="mute">never</span>'}</td><td>${k.expire_time ? (expired(k) ? '<span class="bad">expired</span>' : `<span title="${esc(when(k.expire_time))}">${until(k.expire_time)}</span>`) : '<span class="mute">never</span>'}</td>
+    <td><button class="danger" data-a="revoke" data-id="${esc(k.id)}" data-n="${esc(k.name)}">revoke</button></td></tr>`).join('')}</tbody></table>`
+    : `<div class="card empty">No API keys yet.</div>`;
 }
 
 window.addEventListener('hashchange', route);

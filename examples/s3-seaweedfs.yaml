@@ -1,0 +1,32 @@
+# S3-compatible object storage (SeaweedFS) on one volunteer node. Any S3 SDK works: boto3,
+# aws-sdk, rclone, `aws s3 --endpoint-url`.
+#   ogm secret set s3-access-key && ogm secret set s3-secret-key
+#   ogm deploy -f examples/s3-seaweedfs.yaml
+# Apps in the project use
+#   AWS_ENDPOINT_URL: http://{{link:s3:8333}}
+#   AWS_ACCESS_KEY_ID: "{{secret:s3-access-key}}"
+#   AWS_SECRET_ACCESS_KEY: "{{secret:s3-secret-key}}"
+# Single replica, single copy: fine for caches and scratch data, not for anything you can't
+# lose. (Geo-replicated storage across nodes is a planned anchor-tier feature.)
+name: s3
+replicas: 1
+priority: high
+container:
+  image: chrislusf/seaweedfs:latest
+  command:
+    - sh
+    - -c
+    - >-
+      printf '{"identities":[{"name":"admin","credentials":[{"accessKey":"%s","secretKey":"%s"}],"actions":["Admin","Read","Write","List","Tagging"]}]}'
+      "$S3_ACCESS_KEY" "$S3_SECRET_KEY" > /tmp/s3.json &&
+      exec weed server -dir=/data -s3 -s3.port=8333 -s3.config=/tmp/s3.json -master.volumeSizeLimitMB=1024
+  env:
+    S3_ACCESS_KEY: "{{secret:s3-access-key}}"
+    S3_SECRET_KEY: "{{secret:s3-secret-key}}"
+  ports: [8333]
+  volumes:
+    - { name: data, mount: /data }
+  resources: { cpu: 1, memory_mb: 1024 }
+readiness_probe:
+  tcp: { port: 8333 }
+  period_seconds: 5

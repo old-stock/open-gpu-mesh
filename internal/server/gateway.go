@@ -27,6 +27,13 @@ type Gateway struct {
 	cache     map[string]*backendSet
 	waiters   map[string]chan struct{}
 	transport *http.Transport
+	// HTTP autoscaler demand tracking (per group): requests in flight and requests queued.
+	ginflight map[string]int
+	gwaiting  map[string]int
+	samples   map[string][]float64 // 1 s demand samples, newest last
+	lowSince  map[string]time.Time
+	domains   map[string]string // custom domain -> group id
+	domainsAt time.Time
 }
 
 type backend struct {
@@ -47,7 +54,8 @@ var (
 )
 
 func newGateway(s *Server) *Gateway {
-	gw := &Gateway{s: s, inflight: map[string]int{}, rr: map[string]int{}, cache: map[string]*backendSet{}, waiters: map[string]chan struct{}{}}
+	gw := &Gateway{s: s, inflight: map[string]int{}, rr: map[string]int{}, cache: map[string]*backendSet{}, waiters: map[string]chan struct{}{},
+		ginflight: map[string]int{}, gwaiting: map[string]int{}, samples: map[string][]float64{}, lowSince: map[string]time.Time{}}
 	gw.transport = &http.Transport{
 		DialContext:           gw.dial,
 		MaxIdleConnsPerHost:   64,
@@ -126,6 +134,18 @@ func (gw *Gateway) backendsLocked(g *store.GroupRow) *backendSet {
 
 func (gw *Gateway) acquire(ctx context.Context, g *store.GroupRow, tried map[string]bool, deadline time.Time) (backend, error) {
 	n := g.Spec.Networking
+	limit := n.MaxConcurrency
+	if n.SingleConnectionLimit {
+		limit = 1
+	}
+	woke, waiting := false, false
+	defer func() {
+		if waiting {
+			gw.mu.Lock()
+			gw.gwaiting[g.ID]--
+			gw.mu.Unlock()
+		}
+	}()
 	for {
 		gw.mu.Lock()
 		bs := gw.backendsLocked(g)
@@ -135,7 +155,7 @@ func (gw *Gateway) acquire(ctx context.Context, g *store.GroupRow, tried map[str
 				continue
 			}
 			candidates = append(candidates, b)
-			if !n.SingleConnectionLimit || gw.inflight[b.inst] == 0 {
+			if limit == 0 || gw.inflight[b.inst] < limit {
 				avail = append(avail, b)
 			}
 		}
@@ -157,11 +177,23 @@ func (gw *Gateway) acquire(ctx context.Context, g *store.GroupRow, tried map[str
 				}
 			}
 			gw.inflight[pick.inst]++
+			gw.ginflight[g.ID]++
 			gw.mu.Unlock()
 			return pick, nil
 		}
-		// Nothing available. Fail fast if nothing will ever become available.
-		if len(candidates) == 0 && bs.starting == 0 {
+		if !waiting {
+			waiting = true
+			gw.gwaiting[g.ID]++
+		}
+		// Nothing available. Scale an autoscaled group up from zero; otherwise fail fast if
+		// nothing will ever become available.
+		if len(candidates) == 0 && bs.starting == 0 && !woke {
+			if g.Spec.HTTPAutoscaler != nil {
+				gw.mu.Unlock()
+				woke = true
+				gw.s.scaleFromZero(g.ID)
+				continue
+			}
 			gw.mu.Unlock()
 			return backend{}, errNoBackends
 		}
@@ -201,6 +233,9 @@ func (gw *Gateway) release(groupID string, b backend) {
 	}
 	if gw.inflight[b.inst] == 0 {
 		delete(gw.inflight, b.inst)
+	}
+	if gw.ginflight[groupID] > 0 {
+		gw.ginflight[groupID]--
 	}
 	gw.wake(groupID)
 }
@@ -304,6 +339,18 @@ func (b *releaseRWBody) Close() error {
 
 // serve proxies a request to group g. prefix is stripped from the path (path routing).
 func (gw *Gateway) serve(w http.ResponseWriter, r *http.Request, g *store.GroupRow, prefix string) {
+	start := time.Now()
+	rec := &statusRecorder{ResponseWriter: w}
+	defer func() {
+		if rec.code == 0 {
+			rec.code = 200
+		}
+		gw.s.metrics.observe(g, rec.code, time.Since(start))
+	}()
+	gw.serveInner(rec, r, g, prefix)
+}
+
+func (gw *Gateway) serveInner(w http.ResponseWriter, r *http.Request, g *store.GroupRow, prefix string) {
 	n := g.Spec.Networking
 	if n == nil {
 		problem(w, http.StatusNotFound, "gateway not enabled", "container group "+g.Name+" has no networking.port configured")
@@ -320,7 +367,7 @@ func (gw *Gateway) serve(w http.ResponseWriter, r *http.Request, g *store.GroupR
 		r.URL.RawQuery = q.Encode()
 	}
 	r.Header.Del("OGM-Api-Key")
-	if n.Auth && strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ogm") {
+	if strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ogm") { // never forward hub credentials
 		r.Header.Del("Authorization")
 	}
 	proxy := &httputil.ReverseProxy{
@@ -368,9 +415,12 @@ func (gw *Gateway) authorize(r *http.Request, g *store.GroupRow) bool {
 	if g.GatewayToken != "" && key == g.GatewayToken {
 		return true
 	}
-	u, err := gw.s.st.UserByKey(key)
-	if err != nil {
+	u, sc, _ := gw.s.resolveCredential(key)
+	if u == nil {
 		return false
+	}
+	if sc != nil && sc.Project != "" {
+		return sc.Project == g.Project
 	}
 	if u.Role == "admin" {
 		return true
@@ -403,12 +453,19 @@ func (s *Server) handlePathGateway(w http.ResponseWriter, r *http.Request) {
 
 // hostGateway routes {group}-{project}.{GatewayDomain}. Returns false if not a gateway host.
 func (s *Server) hostGateway(w http.ResponseWriter, r *http.Request) bool {
-	if s.cfg.GatewayDomain == "" {
-		return false
-	}
-	host := r.Host
+	host := strings.ToLower(r.Host)
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
+	}
+	if s.reservedHost(host) {
+		return false
+	}
+	if g := s.groupForDomain(host); g != nil {
+		s.gw.serve(w, r, g, "")
+		return true
+	}
+	if s.cfg.GatewayDomain == "" {
+		return false
 	}
 	suffix := "." + s.cfg.GatewayDomain
 	if !strings.HasSuffix(host, suffix) {
@@ -426,4 +483,37 @@ func (s *Server) hostGateway(w http.ResponseWriter, r *http.Request) bool {
 	}
 	problem(w, http.StatusNotFound, "not found", "no container group for host "+host)
 	return true
+}
+
+// groupForDomain finds the group that lists host in networking.custom_domains (cached 5 s).
+func (s *Server) groupForDomain(host string) *store.GroupRow {
+	if host == "" || net.ParseIP(host) != nil {
+		return nil
+	}
+	s.gw.mu.Lock()
+	if time.Since(s.gw.domainsAt) > 5*time.Second {
+		s.gw.mu.Unlock()
+		m := map[string]string{}
+		if groups, err := s.st.Groups(""); err == nil {
+			for _, g := range groups {
+				if g.Spec.Networking != nil {
+					for _, d := range g.Spec.Networking.CustomDomains {
+						m[d] = g.ID
+					}
+				}
+			}
+		}
+		s.gw.mu.Lock()
+		s.gw.domains, s.gw.domainsAt = m, time.Now()
+	}
+	id := s.gw.domains[host]
+	s.gw.mu.Unlock()
+	if id == "" {
+		return nil
+	}
+	g, err := s.st.GroupByID(id)
+	if err != nil {
+		return nil
+	}
+	return g
 }

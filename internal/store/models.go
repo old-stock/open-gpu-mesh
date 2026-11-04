@@ -169,6 +169,11 @@ func (s *Store) NodeByID(id string) (*NodeRow, error) {
 	return scanNode(s.DB.QueryRow(`SELECT `+nodeCols+` FROM nodes WHERE id=?`, id))
 }
 
+// NodeByName loads a node by its name.
+func (s *Store) NodeByName(name string) (*NodeRow, error) {
+	return scanNode(s.DB.QueryRow(`SELECT `+nodeCols+` FROM nodes WHERE name=?`, name))
+}
+
 // Nodes lists nodes, optionally only online ones.
 func (s *Store) Nodes(onlineOnly bool) ([]*NodeRow, error) {
 	q := `SELECT ` + nodeCols + ` FROM nodes`
@@ -716,4 +721,25 @@ func (s *Store) InsertLogs(nodeID string, lines []proto.LogLine, meta func(insta
 		}
 	}
 	return tx.Commit()
+}
+
+// SaveAssessment stores a node's latest onboarding audit.
+func (s *Store) SaveAssessment(nodeID string, a api.Assessment) error {
+	_, err := s.DB.Exec(`INSERT INTO node_assessments(node_id,data,time) VALUES(?,?,?)
+		ON CONFLICT(node_id) DO UPDATE SET data=excluded.data, time=excluded.time`, nodeID, JSON(a), Now())
+	return err
+}
+
+// Assessment loads a node's latest onboarding audit.
+func (s *Store) Assessment(nodeID string) (*api.Assessment, error) {
+	var data string
+	err := s.DB.QueryRow(`SELECT data FROM node_assessments WHERE node_id=?`, nodeID).Scan(&data)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	a := &api.Assessment{}
+	return a, json.Unmarshal([]byte(data), a)
 }

@@ -22,9 +22,10 @@ func cmdPush(e *env, args []string) {
 	fs := flag.NewFlagSet("push", flag.ExitOnError)
 	project := fs.String("project", e.project, "project (repository namespace)")
 	multi := fs.Bool("multiarch", false, "merge into the tag's existing platforms (push the same tag from x86 and ARM machines)")
+	platform := fs.String("platform", "", "push this platform of a multi-platform local image, e.g. linux/arm64 (Docker's containerd image store); implies --multiarch")
 	pos := parse(fs, args)
 	if len(pos) < 1 {
-		fatalf("usage: ogm push [--multiarch] LOCAL_IMAGE[:TAG] [NAME[:TAG]]")
+		fatalf("usage: ogm push [--multiarch] [--platform linux/arm64] LOCAL_IMAGE[:TAG] [NAME[:TAG]]")
 	}
 	e.client() // ensure logged in
 	src := pos[0]
@@ -40,7 +41,7 @@ func cmdPush(e *env, args []string) {
 		fatalf("docker CLI not found; push needs a local Docker to read the image")
 	}
 	var extra []http.Header
-	if *multi {
+	if *multi || *platform != "" {
 		extra = append(extra, http.Header{"Ogm-Merge-Platforms": {"1"}})
 	}
 	p, err := regproxy.Start(e.cfg.Server, e.cfg.APIKey, 0, extra...)
@@ -56,7 +57,11 @@ func cmdPush(e *env, args []string) {
 	}
 	run("tag", src, dst)
 	defer exec.Command("docker", "rmi", dst).Run() //nolint:errcheck // removes only the temporary tag
-	run("push", dst)
+	if *platform != "" {
+		run("push", "--platform", *platform, dst)
+	} else {
+		run("push", dst)
+	}
 	ref := regproxy.Prefix + *project + "/" + name
 	fmt.Fprintf(e.out, "pushed %s\nuse it in a spec:  container: { image: %s }\n", ref, ref)
 }

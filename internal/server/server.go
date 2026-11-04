@@ -9,9 +9,11 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"golang.org/x/crypto/acme/autocert"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -35,6 +37,10 @@ type Config struct {
 	LogRetention      time.Duration
 	EventRetention    time.Duration
 	Logger            *slog.Logger
+	// TLS turns on automatic HTTPS (Let's Encrypt, HTTP-01) on :443 with an :80 redirect and
+	// challenge listener, for the public URL's host and every networking.custom_domains entry.
+	TLS       bool
+	ACMEEmail string
 }
 
 func (c *Config) defaults() {
@@ -74,19 +80,22 @@ func (c *Config) defaults() {
 
 // Server is the control plane.
 type Server struct {
-	cfg    Config
-	st     *store.Store
-	log    *slog.Logger
-	mu     sync.Mutex // serialises scheduling decisions (lock order: mu -> jobMu)
-	jobMu  sync.Mutex // guards job state transitions
-	hub    *Hub
-	regDir string // built-in image registry storage
-	gw     *Gateway
-	logs   *logBroker
+	cfg     Config
+	st      *store.Store
+	log     *slog.Logger
+	mu      sync.Mutex // serialises scheduling decisions (lock order: mu -> jobMu)
+	jobMu   sync.Mutex // guards job state transitions
+	hub     *Hub
+	regDir  string // built-in image registry storage
+	gw      *Gateway
+	metrics *metricsStore
+	logs    *logBroker
 
 	jwtPriv ed25519.PrivateKey
 	jwtPub  ed25519.PublicKey
 	jwtKid  string
+
+	secretKey []byte // AES-256 key for secrets at rest
 
 	poke     chan struct{}
 	pokeJobs chan struct{}
@@ -123,8 +132,33 @@ func New(cfg Config) (*Server, error) {
 	}
 	s.hub = newHub(s)
 	s.gw = newGateway(s)
+	s.metrics = newMetrics()
 	if err := s.initKeys(); err != nil {
 		return nil, err
+	}
+	if err := s.initSecrets(); err != nil {
+		return nil, fmt.Errorf("secrets: %w", err)
+	}
+	if err := s.initVolumes(); err != nil {
+		return nil, fmt.Errorf("volumes: %w", err)
+	}
+	if err := s.initS3(); err != nil {
+		return nil, fmt.Errorf("s3: %w", err)
+	}
+	if err := s.initIAM(); err != nil {
+		return nil, fmt.Errorf("iam: %w", err)
+	}
+	if err := s.initKV(); err != nil {
+		return nil, fmt.Errorf("kv: %w", err)
+	}
+	if err := s.initSchedules(); err != nil {
+		return nil, fmt.Errorf("schedules: %w", err)
+	}
+	if err := s.initSnapshots(); err != nil {
+		return nil, fmt.Errorf("snapshots: %w", err)
+	}
+	if err := s.initQuotas(); err != nil {
+		return nil, fmt.Errorf("quotas: %w", err)
 	}
 	if _, err := st.DB.Exec(registrySchema); err != nil {
 		return nil, fmt.Errorf("registry schema: %w", err)
@@ -214,9 +248,13 @@ func (s *Server) Run(ctx context.Context) {
 	go s.loop(ctx, s.cfg.ReconcileInterval, s.poke, s.reconcile)
 	go s.loop(ctx, 500*time.Millisecond, s.pokeJobs, s.dispatchJobs)
 	go s.loop(ctx, 5*time.Second, nil, s.autoscale)
+	go s.loop(ctx, time.Second, nil, s.httpAutoscale)
 	go s.loop(ctx, 60*time.Second, nil, s.accrueCredits)
 	go s.loop(ctx, 2*time.Second, nil, s.deliverWebhooks)
 	go s.loop(ctx, 10*time.Minute, nil, s.gc)
+	go s.loop(ctx, time.Minute, nil, s.kvGC)
+	go s.loop(ctx, 5*time.Second, nil, s.runSchedules)
+	go s.loop(ctx, 20*time.Second, nil, s.sampleGroups)
 	<-ctx.Done()
 }
 
@@ -250,10 +288,56 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	return s.Serve(ctx, ln)
 }
 
+// tlsHostPolicy allows certificates only for hosts this hub actually serves.
+func (s *Server) tlsHostPolicy(_ context.Context, host string) error {
+	host = strings.ToLower(host)
+	if u, err := url.Parse(s.cfg.PublicURL); err == nil && strings.EqualFold(u.Hostname(), host) {
+		return nil
+	}
+	if s.groupForDomain(host) != nil {
+		return nil
+	}
+	if d := s.cfg.GatewayDomain; d != "" && strings.HasSuffix(host, "."+d) {
+		sub := strings.TrimSuffix(host, "."+d)
+		for i := 0; i < len(sub); i++ {
+			if sub[i] == '-' {
+				if _, err := s.st.Group(sub[i+1:], sub[:i]); err == nil {
+					return nil
+				}
+			}
+		}
+	}
+	return fmt.Errorf("ogm: no certificate for unknown host %q", host)
+}
+
+func (s *Server) serveTLS(ctx context.Context) {
+	dir := filepath.Join(s.cfg.DataDir, "certs")
+	m := &autocert.Manager{Prompt: autocert.AcceptTOS, Cache: autocert.DirCache(dir), Email: s.cfg.ACMEEmail, HostPolicy: s.tlsHostPolicy}
+	https := &http.Server{Addr: ":443", Handler: s.Handler(), TLSConfig: m.TLSConfig(), ReadHeaderTimeout: 30 * time.Second}
+	plain := &http.Server{Addr: ":80", Handler: m.HTTPHandler(nil), ReadHeaderTimeout: 30 * time.Second}
+	go func() {
+		<-ctx.Done()
+		_ = https.Close()
+		_ = plain.Close()
+	}()
+	go func() {
+		if err := plain.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			s.log.Error("acme :80 listener", "err", err)
+		}
+	}()
+	s.log.Info("automatic HTTPS on :443", "cert_cache", dir)
+	if err := https.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		s.log.Error("https listener", "err", err)
+	}
+}
+
 // Serve serves on an existing listener.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	srv := &http.Server{Handler: s.Handler(), ReadHeaderTimeout: 30 * time.Second}
 	go s.Run(ctx)
+	if s.cfg.TLS {
+		go s.serveTLS(ctx)
+	}
 	go func() {
 		<-ctx.Done()
 		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

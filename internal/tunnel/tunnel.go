@@ -66,6 +66,16 @@ func (e *DialError) Unwrap() error { return e.Err }
 
 // OpenProxy opens a data stream to an instance port through a session.
 func OpenProxy(ctx context.Context, sess *yamux.Session, instanceID string, port int) (net.Conn, error) {
+	return Open(ctx, sess, proto.StreamHeader{Kind: "proxy", InstanceID: instanceID, Port: port})
+}
+
+// OpenLink asks the hub (agent side) to connect a local instance to a port of another group.
+func OpenLink(ctx context.Context, sess *yamux.Session, callerID, group string, port int) (net.Conn, error) {
+	return Open(ctx, sess, proto.StreamHeader{Kind: "link", InstanceID: callerID, Group: group, Port: port})
+}
+
+// Open opens a stream, writes the header and waits for the one-byte ack.
+func Open(ctx context.Context, sess *yamux.Session, h proto.StreamHeader) (net.Conn, error) {
 	st, err := sess.OpenStream()
 	if err != nil {
 		return nil, &DialError{err}
@@ -75,7 +85,7 @@ func OpenProxy(ctx context.Context, sess *yamux.Session, instanceID string, port
 	} else {
 		_ = st.SetDeadline(time.Now().Add(30 * time.Second))
 	}
-	hdr, _ := json.Marshal(proto.StreamHeader{Kind: "proxy", InstanceID: instanceID, Port: port})
+	hdr, _ := json.Marshal(h)
 	if _, err := st.Write(append(hdr, '\n')); err != nil {
 		st.Close()
 		return nil, &DialError{err}
@@ -87,7 +97,11 @@ func OpenProxy(ctx context.Context, sess *yamux.Session, instanceID string, port
 	}
 	if ack[0] != proto.AckOK {
 		st.Close()
-		return nil, &DialError{fmt.Errorf("instance %s port %d refused connection", instanceID, port)}
+		target := h.InstanceID
+		if h.Kind == "link" {
+			target = "group " + h.Group
+		}
+		return nil, &DialError{fmt.Errorf("%s port %d refused connection", target, h.Port)}
 	}
 	_ = st.SetDeadline(time.Time{})
 	return st, nil

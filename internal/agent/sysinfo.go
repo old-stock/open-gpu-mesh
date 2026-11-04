@@ -173,3 +173,7 @@ func runningProcesses(ctx context.Context) map[string]bool {
 	}
 	return out
 }
+
+// RunningProcesses lists lower-cased process names on this machine (including Windows
+// processes when running under WSL).
+func RunningProcesses(ctx context.Context) map[string]bool { return runningProcesses(ctx) }
